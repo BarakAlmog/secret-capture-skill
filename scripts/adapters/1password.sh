@@ -51,6 +51,21 @@ done
 
 ROTATE="${ROTATE:-}"
 
+# SC_CHECK=1: capture.sh runs this before the dialog opens, with no value.
+# Everything that can fail without the value fails here, before the user pastes.
+if [[ -n "${SC_CHECK:-}" ]]; then
+  op vault get "$VAULT" --format=json >/dev/null \
+    || { echo "ADAPTER_ERROR: vault '$VAULT' is not reachable with this 1Password session" >&2; exit 7; }
+  if op item get "$ITEM" --vault "$VAULT" --format=json >/dev/null 2>&1; then
+    [[ -n "$ROTATE" ]] && exit 0
+    echo "DUPLICATE: item '$ITEM' exists in vault '$VAULT'; pass --rotate to overwrite" >&2
+    exit 6
+  fi
+  [[ -z "$ROTATE" ]] && exit 0
+  echo "NOT_FOUND: item '$ITEM' is not in vault '$VAULT'; nothing to rotate" >&2
+  exit 7
+fi
+
 umask 077
 payload=$(mktemp -t sc-1p-XXXXXX)
 fullitem=$(mktemp -t sc-1p-full-XXXXXX)

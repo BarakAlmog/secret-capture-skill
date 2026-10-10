@@ -103,6 +103,18 @@ fi
 
 [[ -z "$PROMPT_LABEL" ]] && PROMPT_LABEL="$TARGET"
 
+# Nothing that can fail without the value may fail after the user pastes it.
+# The pattern is looked up now, and an adapter that supports SC_CHECK checks
+# its destination now (reachable, duplicate, rotate target), with no stdin.
+# Only adapters that name SC_CHECK run this: the rest would read the empty
+# stdin as a value and write it.
+if [[ -n "$EXPECT" ]]; then
+  lookup_pattern "$EXPECT" >/dev/null || exit $?
+fi
+if grep -q 'SC_CHECK' "$ADAPTER_SCRIPT"; then
+  SC_CHECK=1 ROTATE="$ROTATE" SKILL_ROOT="$SKILL_ROOT" bash "$ADAPTER_SCRIPT" ${ADAPTER_ARGS[@]+"${ADAPTER_ARGS[@]}"} </dev/null || exit $?
+fi
+
 # Two-stage capture:
 #   1. dialog_capture → 0600 tempfile (exit code CHECKED before continuing)
 #   2. optional validate → same tempfile
@@ -123,19 +135,12 @@ trap cleanup_value EXIT
 dialog_capture "$PROMPT_LABEL" > "$valfile" || exit $?
 
 if [[ -n "$EXPECT" ]]; then
-  # A2 — one retry on FORMAT_MISMATCH. Rationale: a single stray character
-  # (trailing space, accidental prefix) is the common cause; forcing the
-  # user to re-invoke the whole skill for a typo-grade mistake is friction.
-  # Two attempts total — first failure reopens the dialog, second failure
-  # exits FORMAT_MISMATCH.
-  valfile_validated=$(mktemp -t sc-value-v-XXXXXX)
-  trap 'shred -u "$valfile" "$valfile_validated" 2>/dev/null || rm -f "$valfile" "$valfile_validated"' EXIT
-  if ! validate_and_forward "$EXPECT" < "$valfile" > "$valfile_validated" 2>/dev/null; then
-    echo "FORMAT_MISMATCH: value does not match '$EXPECT' — reopening dialog once" >&2
-    dialog_capture "$PROMPT_LABEL" > "$valfile" || exit $?
-    validate_and_forward "$EXPECT" < "$valfile" > "$valfile_validated" || exit $?
-  fi
-  mv "$valfile_validated" "$valfile"
+  # Advisory only: a shape is a guess, and providers change key formats. A
+  # mismatch is reported and the value is stored anyway; it never drops the
+  # paste or reopens the dialog. The user checks the warning, and rotates if
+  # the paste really was wrong.
+  validate_and_forward "$EXPECT" < "$valfile" > /dev/null 2>&1 \
+    || echo "WARNING: value does not look like '$EXPECT'; stored anyway" >&2
 fi
 
 ROTATE="$ROTATE" SKILL_ROOT="$SKILL_ROOT" bash "$ADAPTER_SCRIPT" ${ADAPTER_ARGS[@]+"${ADAPTER_ARGS[@]}"} < "$valfile"

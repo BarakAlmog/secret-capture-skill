@@ -32,7 +32,7 @@ Never store the same secret in two places.
 The skill is a bash script. Invoke via the Bash tool:
 
 ```bash
-bash ~/.claude/skills/secret-capture/scripts/capture.sh --target <target> [target-flags] [--rotate] [--expect <shape>]
+bash ~/.claude/skills/secret-capture-skill/scripts/capture.sh --target <target> [target-flags] [--rotate] [--expect <shape>]
 ```
 
 You pass only the destination metadata. You never pass, read, or handle the value. The script opens a hidden-input dialog, captures the value, pipes it directly to the destination, and returns a reference on stdout.
@@ -165,7 +165,7 @@ Pass `--expect <shape>` to sanity-check the captured value before writing:
 bash capture.sh --target 1password --vault Personal --item openai-key --field credential --expect openai
 ```
 
-Shapes supported out of the box: `openai`, `anthropic`, `github-pat`, `aws-access-key`, `stripe`, `cloudflare-token`, `slack`. On mismatch, the dialog reopens once; if still mismatch, returns `FORMAT_MISMATCH`.
+Shapes supported out of the box: `openai`, `anthropic`, `github-pat`, `aws-access-key`, `stripe`, `cloudflare-token`, `slack`. Advisory only: a mismatch prints `WARNING` on stderr and the value is stored anyway. A guessed shape never drops a paste. Before the dialog opens, the pattern is looked up and an adapter that supports `SC_CHECK` (1password) checks its destination: vault reachable, duplicate, rotate target. Nothing that can fail without the value fails after the user pastes.
 
 ## Return values
 
@@ -188,7 +188,7 @@ security find-generic-password -s anthropic-cli -w | some-cli --stdin
 - `TIMEOUT` — dialog auto-dismissed (osascript 2-min limit)
 - `AUTH_FAIL` — destination auth failed; fix credentials and retry
 - `DUPLICATE` — item exists; re-invoke with `--rotate` or pick a different name
-- `FORMAT_MISMATCH` — `--expect` regex didn't match
+- `FORMAT_MISMATCH` — `--expect` names an unknown pattern (checked before the dialog)
 - `ADAPTER_ERROR` — subcommand failed; check adapter preflight
 
 None of these ever contain the value.
