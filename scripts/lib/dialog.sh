@@ -33,7 +33,12 @@ dialog_capture() {
     # "Automation → System Events" in macOS Privacy & Security, which fails
     # silently with AppleEvent -1712 when not granted. The top-level form
     # has no such dependency.
+    #
+    # `activate` first: osascript is a background process, so without it the
+    # dialog opens behind the frontmost app with no keyboard focus and looks
+    # stuck until clicked.
     value=$(osascript \
+      -e 'activate' \
       -e "display dialog \"Enter $prompt (input hidden):\" default answer \"\" with hidden answer with title \"secret-capture\"" \
       -e 'text returned of result' 2>/dev/null) || {
       echo "CANCELLED" >&2
