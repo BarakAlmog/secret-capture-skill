@@ -30,7 +30,7 @@ normalize_category() {
 
 VAULT=""
 ITEM=""
-FIELD="credential"
+FIELDS=()
 CATEGORY="API_CREDENTIAL"
 TITLE=""
 
@@ -38,7 +38,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --vault) VAULT="$2"; shift 2 ;;
     --item) ITEM="$2"; shift 2 ;;
-    --field) FIELD="$2"; shift 2 ;;
+    --field) FIELDS+=("$2"); shift 2 ;;
     --category) CATEGORY="$(normalize_category "$2")"; shift 2 ;;
     --title) TITLE="$2"; shift 2 ;;
     *) echo "USAGE_ERROR: unknown arg '$1'" >&2; exit 2 ;;
@@ -48,6 +48,8 @@ done
 [[ -z "$VAULT" ]] && { echo "USAGE_ERROR: --vault required" >&2; exit 2; }
 [[ -z "$ITEM" ]]  && { echo "USAGE_ERROR: --item required" >&2; exit 2; }
 [[ -z "$TITLE" ]] && TITLE="$ITEM"
+FIELD="${FIELDS[0]:-credential}"
+FIELD="${FIELD%%:*}"
 
 ROTATE="${ROTATE:-}"
 
@@ -69,8 +71,55 @@ fi
 umask 077
 payload=$(mktemp -t sc-1p-XXXXXX)
 fullitem=$(mktemp -t sc-1p-full-XXXXXX)
-cleanup() { shred -u "$payload" "$fullitem" 2>/dev/null || rm -f "$payload" "$fullitem"; }
+nextpayload=$(mktemp -t sc-1p-next-XXXXXX)
+cleanup() { shred -u "$payload" "$fullitem" "$nextpayload" 2>/dev/null || rm -f "$payload" "$fullitem" "$nextpayload"; }
 trap cleanup EXIT
+
+# Several fields (capture.sh passed SC_VALUES_DIR): value n of --field n is the file
+# $SC_VALUES_DIR/n. One item holds them all. On a LOGIN item "username" and "password"
+# carry 1Password's login purposes so autofill finds them; a ":visible" field is plain
+# text, every other field is concealed.
+if [[ -n "${SC_VALUES_DIR:-}" ]]; then
+  if op item get "$ITEM" --vault "$VAULT" --format=json >/dev/null 2>&1; then
+    [[ -n "$ROTATE" ]] \
+      || { echo "DUPLICATE: item '$ITEM' exists in vault '$VAULT'; pass --rotate to overwrite" >&2; exit 6; }
+    op item get "$ITEM" --vault "$VAULT" --format=json --reveal > "$fullitem" \
+      || { echo "ADAPTER_ERROR: op item get --reveal failed" >&2; exit 7; }
+    jq '{title: .title, category: .category, fields: (.fields // []), sections: (.sections // []), tags: (.tags // []), urls: (.urls // [])}' \
+      "$fullitem" > "$payload"
+    i=0
+    for spec in "${FIELDS[@]}"; do
+      i=$((i + 1))
+      jq -e --arg f "${spec%%:*}" '.fields | any(.label == $f or .id == $f)' "$payload" >/dev/null \
+        || { echo "ADAPTER_ERROR: field '${spec%%:*}' not found on existing item; aborting to preserve original" >&2; exit 7; }
+      jq --arg f "${spec%%:*}" --rawfile v "$SC_VALUES_DIR/$i" \
+        '.fields |= map(if (.label == $f or .id == $f) then .value = ($v | rtrimstr("\n")) else . end)' \
+        "$payload" > "$nextpayload"
+      cp "$nextpayload" "$payload"
+    done
+    op item delete "$ITEM" --vault "$VAULT" --archive >/dev/null \
+      || { echo "ADAPTER_ERROR: failed to archive existing item for rotation" >&2; exit 7; }
+  else
+    jq -n --arg title "$TITLE" --arg cat "$CATEGORY" '{title: $title, category: $cat, fields: []}' > "$payload"
+    i=0
+    for spec in "${FIELDS[@]}"; do
+      i=$((i + 1))
+      name="${spec%%:*}"
+      type=CONCEALED; purpose=""
+      [[ "$spec" == *:visible ]] && type=STRING
+      if [[ "$CATEGORY" == LOGIN && "$name" == username ]]; then type=STRING; purpose=USERNAME; fi
+      if [[ "$CATEGORY" == LOGIN && "$name" == password ]]; then type=CONCEALED; purpose=PASSWORD; fi
+      jq --arg f "$name" --arg t "$type" --arg p "$purpose" --rawfile v "$SC_VALUES_DIR/$i" \
+        '.fields += [{id: $f, label: $f, type: $t, value: ($v | rtrimstr("\n"))} + (if $p == "" then {} else {purpose: $p} end)]' \
+        "$payload" > "$nextpayload"
+      cp "$nextpayload" "$payload"
+    done
+  fi
+  op item create --vault "$VAULT" --template "$payload" </dev/null >/dev/null \
+    || { echo "ADAPTER_ERROR: op item create failed" >&2; exit 7; }
+  for spec in "${FIELDS[@]}"; do printf 'op://%s/%s/%s\n' "$VAULT" "$ITEM" "${spec%%:*}"; done
+  exit 0
+fi
 
 if op item get "$ITEM" --vault "$VAULT" --format=json >/dev/null 2>&1; then
   if [[ -z "$ROTATE" ]]; then

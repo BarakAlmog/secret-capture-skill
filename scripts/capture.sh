@@ -36,6 +36,10 @@ secret-capture — capture a secret via hidden-input dialog and route it to a de
 
 Usage:
   capture.sh --target <target> [target-flags] [--rotate] [--expect <shape>] [--prompt <label>]
+             [--field <name>[:visible]]...
+
+Two or more --field flags open one window with a box per field (1password only);
+":visible" shows that box as typed (a username), every other box is hidden.
 
 Targets: 1password | keychain | gh-secret | wrangler | coolify | n8n | env-file | ssh
 
@@ -48,10 +52,12 @@ ROTATE=""
 EXPECT=""
 PROMPT_LABEL=""
 ADAPTER_ARGS=()
+FIELD_SPECS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --target) TARGET="$2"; shift 2 ;;
+    --field) FIELD_SPECS+=("$2"); shift 2 ;;
     --rotate) ROTATE="1"; shift ;;
     --expect) EXPECT="$2"; shift 2 ;;
     --prompt) PROMPT_LABEL="$2"; shift 2 ;;
@@ -79,6 +85,22 @@ fi
 ADAPTER_SCRIPT="$SKILL_ROOT/scripts/adapters/${TARGET}.sh"
 [[ -f "$ADAPTER_SCRIPT" ]] \
   || { echo "USAGE_ERROR: unknown target '$TARGET'" >&2; exit 2; }
+
+# Several --field flags: one window, one value per field, handed to the adapter
+# as files in SC_VALUES_DIR. Only an adapter that reads SC_VALUES_DIR takes them.
+MULTI=""
+if (( ${#FIELD_SPECS[@]} > 1 )); then
+  grep -q 'SC_VALUES_DIR' "$ADAPTER_SCRIPT" \
+    || { echo "USAGE_ERROR: target '$TARGET' takes one value; pass one --field" >&2; exit 2; }
+  [[ -n "$EXPECT" ]] \
+    && { echo "USAGE_ERROR: --expect checks one value; drop it when passing several --field" >&2; exit 2; }
+  dupes=$(printf '%s\n' "${FIELD_SPECS[@]%%:*}" | sort | uniq -d)
+  [[ -z "$dupes" ]] || { echo "USAGE_ERROR: field named twice: $dupes" >&2; exit 2; }
+  MULTI=1
+fi
+for spec in ${FIELD_SPECS[@]+"${FIELD_SPECS[@]}"}; do
+  if [[ -n "$MULTI" ]]; then ADAPTER_ARGS+=(--field "$spec"); else ADAPTER_ARGS+=(--field "${spec%%:*}"); fi
+done
 
 config_adapter_enabled "$TARGET" \
   || { echo "DISABLED: '$TARGET' is not in adapters.enabled" >&2; exit 2; }
@@ -128,6 +150,20 @@ fi
 # tempfiles (wrangler/coolify/n8n all already do this).
 
 umask 077
+
+if [[ -n "$MULTI" ]]; then
+  valdir=$(mktemp -d -t sc-values-XXXXXX)
+  cleanup_values() {
+    local f
+    for f in "$valdir"/*; do [[ -e "$f" ]] && { shred -u "$f" 2>/dev/null || rm -f "$f"; }; done
+    rmdir "$valdir"
+  }
+  trap cleanup_values EXIT
+  dialog_capture_many "$valdir" "$PROMPT_LABEL" "${FIELD_SPECS[@]}" || exit $?
+  SC_VALUES_DIR="$valdir" ROTATE="$ROTATE" SKILL_ROOT="$SKILL_ROOT" bash "$ADAPTER_SCRIPT" "${ADAPTER_ARGS[@]}" </dev/null
+  exit $?
+fi
+
 valfile=$(mktemp -t sc-value-XXXXXX)
 cleanup_value() { shred -u "$valfile" 2>/dev/null || rm -f "$valfile"; }
 trap cleanup_value EXIT

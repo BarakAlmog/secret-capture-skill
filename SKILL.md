@@ -53,6 +53,20 @@ Returns: `op://<vault>/<item>/<field>`
 
 Use when the user will consume this secret from their machine (`op read ...`).
 
+**Several values in one window.** Repeat `--field`, one per value: the dialog shows one box
+per field and the adapter writes one item holding them all. `<name>:visible` shows that box
+as typed (a username); every other box is hidden. Every box must be filled, or nothing is
+written. On a `LOGIN` item, `username` and `password` get 1Password's login purposes.
+
+```bash
+bash capture.sh --target 1password --vault <vault> --item <item> --category LOGIN \
+  --prompt "<service> login" --field username:visible --field password [--field <name>]...
+```
+
+Returns one `op://<vault>/<item>/<field>` line per field. With `--rotate`, every named field
+must already exist on the item. `--expect` takes one value, so it is refused here. Only the
+`1password` target takes several fields.
+
 ### `keychain`
 
 ```bash
