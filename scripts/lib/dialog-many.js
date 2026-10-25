@@ -47,6 +47,11 @@ function run(argv) {
   alert.accessoryView = view
   alert.window.initialFirstResponder = fields[0]
   app.activateIgnoringOtherApps(true)
+  // Above every other window, even when macOS declines to make osascript the active app.
+  alert.layout
+  alert.window.level = $.NSStatusWindowLevel
+  alert.window.orderFrontRegardless
+  alert.window.makeKeyAndOrderFront(null)
 
   if (alert.runModal !== $.NSAlertFirstButtonReturn) return 'cancelled'
 

@@ -24,26 +24,19 @@ dialog_capture() {
   local value=""
 
   if _has_gui_macos; then
-    # osascript hidden-input dialog. Value comes back on stdout.
-    # 2>/dev/null swallows the "user cancelled" stderr message.
-    #
-    # Uses `display dialog` at the top level (not wrapped in
-    # `tell application "System Events"`) so osascript itself owns the dialog.
-    # Wrapping in System Events requires the parent app to have
-    # "Automation → System Events" in macOS Privacy & Security, which fails
-    # silently with AppleEvent -1712 when not granted. The top-level form
-    # has no such dependency.
-    #
-    # `activate` first: osascript is a background process, so without it the
-    # dialog opens behind the frontmost app with no keyboard focus and looks
-    # stuck until clicked.
-    value=$(osascript \
-      -e 'activate' \
-      -e "display dialog \"Enter $prompt (input hidden):\" default answer \"\" with hidden answer with title \"secret-capture\"" \
-      -e 'text returned of result' 2>/dev/null) || {
-      echo "CANCELLED" >&2
-      return 4
-    }
+    # The same window as dialog_capture_many (dialog-many.js), with one hidden box: it
+    # comes to the front with focus and takes Cmd+V. The old `display dialog` opened
+    # behind the frontmost app and looked stuck (2026-10-25).
+    local dir result
+    dir=$(mktemp -d -t sc-one-XXXXXX)
+    result=$(osascript -l JavaScript "$SKILL_ROOT/scripts/lib/dialog-many.js" "$dir" "secret-capture" "$prompt" hidden) \
+      || { rm -rf "$dir"; echo "ADAPTER_ERROR: the dialog failed" >&2; return 7; }
+    if [[ "$result" != ok || ! -s "$dir/1" ]]; then
+      rm -rf "$dir"; echo "CANCELLED" >&2; return 4
+    fi
+    value=$(cat "$dir/1")
+    { shred -u "$dir/1" 2>/dev/null || rm -f "$dir/1"; }
+    rmdir "$dir"
   elif _has_tty; then
     # TTY fallback: read -s suppresses echo.
     printf 'Enter %s (hidden): ' "$prompt" >&2
