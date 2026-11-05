@@ -11,8 +11,12 @@
 #
 # Field preservation on rotate: we first `op item get --reveal` to read the full current
 # item (values included — briefly transits jq's memory, never argv/env/stdout), use jq to
-# swap just the target field's value, then delete-archive + recreate with the full template.
-# Non-target fields (notes, username, dates, etc.) round-trip untouched.
+# swap just the target field's value, then recreate with the full template. Non-target fields
+# (notes, username, dates, etc.) round-trip untouched.
+#
+# The old item goes to the archive under a dated title: an archived item that keeps the name
+# makes `op run`, `op read` and `op item get` fail with "more than one item". It is renamed
+# before the new one exists and archived after, so a failed create can put it back unharmed.
 #
 # Why CATEGORY default is "API_CREDENTIAL" (not "API Credential"): op CLI requires the
 # uppercase-underscore template ID. Get the canonical list via `op item template list`.
@@ -79,6 +83,30 @@ trap cleanup EXIT
 # $SC_VALUES_DIR/n. One item holds them all. On a LOGIN item "username" and "password"
 # carry 1Password's login purposes so autofill finds them; a ":visible" field is plain
 # text, every other field is concealed.
+#
+# Rotating: "$fullitem" holds the old item, and create_item replaces it.
+rotating=""
+create_item() {
+  local old_id=""
+  if [[ -n "$rotating" ]]; then
+    old_id=$(jq -r .id "$fullitem")
+    op item edit "$old_id" --vault "$VAULT" --title "$ITEM-rotated-$(date +%Y%m%d-%H%M%S)" </dev/null >/dev/null \
+      || { echo "ADAPTER_ERROR: failed to retire the old item for rotation" >&2; exit 7; }
+  fi
+  if ! op item create --vault "$VAULT" --template "$payload" </dev/null >/dev/null; then
+    if [[ -n "$old_id" ]]; then
+      op item edit "$old_id" --vault "$VAULT" --title "$ITEM" </dev/null >/dev/null \
+        || echo "ADAPTER_ERROR: the old item keeps its dated title; rename it back to '$ITEM'" >&2
+    fi
+    echo "ADAPTER_ERROR: op item create failed" >&2
+    exit 7
+  fi
+  if [[ -n "$old_id" ]]; then
+    op item delete "$old_id" --vault "$VAULT" --archive </dev/null >/dev/null \
+      || echo "WARNING: the old item is still active under its dated title; archive it" >&2
+  fi
+}
+
 if [[ -n "${SC_VALUES_DIR:-}" ]]; then
   if op item get "$ITEM" --vault "$VAULT" --format=json >/dev/null 2>&1; then
     [[ -n "$ROTATE" ]] \
@@ -97,8 +125,7 @@ if [[ -n "${SC_VALUES_DIR:-}" ]]; then
         "$payload" > "$nextpayload"
       cp "$nextpayload" "$payload"
     done
-    op item delete "$ITEM" --vault "$VAULT" --archive >/dev/null \
-      || { echo "ADAPTER_ERROR: failed to archive existing item for rotation" >&2; exit 7; }
+    rotating=1
   else
     jq -n --arg title "$TITLE" --arg cat "$CATEGORY" '{title: $title, category: $cat, fields: []}' > "$payload"
     i=0
@@ -115,8 +142,7 @@ if [[ -n "${SC_VALUES_DIR:-}" ]]; then
       cp "$nextpayload" "$payload"
     done
   fi
-  op item create --vault "$VAULT" --template "$payload" </dev/null >/dev/null \
-    || { echo "ADAPTER_ERROR: op item create failed" >&2; exit 7; }
+  create_item
   for spec in "${FIELDS[@]}"; do printf 'op://%s/%s/%s\n' "$VAULT" "$ITEM" "${spec%%:*}"; done
   exit 0
 fi
@@ -155,8 +181,7 @@ if op item get "$ITEM" --vault "$VAULT" --format=json >/dev/null 2>&1; then
     exit 7
   fi
 
-  op item delete "$ITEM" --vault "$VAULT" --archive >/dev/null 2>&1 \
-    || { echo "ADAPTER_ERROR: failed to archive existing item for rotation" >&2; exit 7; }
+  rotating=1
 else
   # Create path: new item with just the target field.
   jq -n \
@@ -173,7 +198,6 @@ else
      }' > "$payload"
 fi
 
-op item create --vault "$VAULT" --template "$payload" </dev/null >/dev/null 2>&1 \
-  || { echo "ADAPTER_ERROR: op item create failed" >&2; exit 7; }
+create_item
 
 printf 'op://%s/%s/%s\n' "$VAULT" "$ITEM" "$FIELD"
