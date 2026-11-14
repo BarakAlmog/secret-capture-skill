@@ -85,6 +85,11 @@ readback_matches() {
 slot_lock() {
   mkdir -p "$SC_SLOT_DIR"
   chmod 700 "$SC_SLOT_DIR"
+  # `ln -s` into an existing directory would succeed inside it and lock nothing.
+  if [[ -e "$SC_SLOT_LOCK" && ! -L "$SC_SLOT_LOCK" ]]; then
+    echo "ADAPTER_ERROR: $SC_SLOT_LOCK is not a lock symlink (a directory lock from an older version?); make sure no capture is running, remove it, and retry" >&2
+    return 7
+  fi
   ln -s "$$" "$SC_SLOT_LOCK" 2>/dev/null && return 0
   local holder="" moved="$SC_SLOT_LOCK.stale.$$"
   holder=$(readlink "$SC_SLOT_LOCK") \

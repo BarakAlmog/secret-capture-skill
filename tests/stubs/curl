@@ -7,6 +7,7 @@
 # Each request is also recorded as $SC_TEST_DEST/http/<n>.{method,url,headers,body}.
 #   SC_FAKE_HTTP_STATUS=<code>   every write answers <code>
 #   SC_FAKE_COOLIFY_MANGLE=1     Coolify stores the value with a trailing space
+#   SC_FAKE_N8N_LIST=<file>      n8n's credential list answers with that file
 # --fail on a status >= 400 exits 22 with curl's message.
 set -euo pipefail
 method=GET url="" out="" fail="" body_from="" headers=()
@@ -62,6 +63,7 @@ else
       ;;
     "GET api/v1/credentials")
       store="$SC_TEST_DEST/n8n.json"
+      [[ -n "${SC_FAKE_N8N_LIST:-}" ]] && { cat "$SC_FAKE_N8N_LIST"; exit 0; }
       response=$(jq -c '{data: [.[] | {id, name, type}], nextCursor: null}' "$store" 2>/dev/null || echo '{"data":[],"nextCursor":null}')
       ;;
     "POST api/v1/credentials")

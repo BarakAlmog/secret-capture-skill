@@ -58,15 +58,21 @@ CREDS_URL="${URL%/}/api/v1/credentials"
 # find_cred_id — the id of the credential named $CRED_NAME of type $CRED_TYPE, or nothing.
 # GET /credentials lists names and types, never secrets (n8n public API), page by page.
 find_cred_id() {
-  local cursor="" page ids="" query
+  local cursor="" page page_ids ids="" query
   while :; do
     query="limit=250"
     [[ -n "$cursor" ]] && query="$query&cursor=$(jq -rn --arg c "$cursor" '$c | @uri')"
     page=$(curl -sS --fail "$CREDS_URL?$query" \
              -H @<(printf 'X-N8N-API-KEY: '; resolve_source "$API_KEY_SOURCE"; printf '\n')) \
       || { echo "ADAPTER_ERROR: could not list n8n credentials (GET /api/v1/credentials, above)" >&2; return 7; }
-    ids="$ids $(printf '%s' "$page" | jq -r --arg n "$CRED_NAME" --arg t "$CRED_TYPE" '[.data[] | select(.name == $n and .type == $t) | .id] | join(" ")')"
-    cursor=$(printf '%s' "$page" | jq -r '.nextCursor // empty')
+    # A page in another shape fails here, loudly: it must never read as "no duplicate".
+    printf '%s' "$page" | jq -e '(.data | type) == "array" and (.data | all(type == "object" and (.id | type) == "string"))' >/dev/null \
+      || { echo "ADAPTER_ERROR: n8n's credential list is not {data: [{id, name, type}...]}; not verified whether '$CRED_NAME' exists" >&2; return 7; }
+    page_ids=$(printf '%s' "$page" | jq -r --arg n "$CRED_NAME" --arg t "$CRED_TYPE" '[.data[] | select(.name == $n and .type == $t) | .id] | join(" ")') \
+      || { echo "ADAPTER_ERROR: could not read n8n's credential list (above)" >&2; return 7; }
+    ids="$ids $page_ids"
+    cursor=$(printf '%s' "$page" | jq -r '.nextCursor // empty') \
+      || { echo "ADAPTER_ERROR: could not read n8n's credential list cursor (above)" >&2; return 7; }
     [[ -n "$cursor" ]] || break
   done
   local found=()

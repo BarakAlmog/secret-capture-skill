@@ -357,6 +357,15 @@ capture --target 1password --vault f7-test --item sc-b
 check "a dead holder's lock is taken over" rc_is 0
 check "no leak" no_leak sc-test-busy
 
+fresh "a capture.lock that is not a symlink is refused"
+mkdir -p "$HOME/.f7/sealed/capture.lock"
+export SC_TEST_ANSWERS='{"value":"sc-test-dirlock"}'
+capture --target 1password --vault f7-test --item sc-dl
+check "exit 7" rc_is 7
+check "says why" err_has "is not a lock symlink"
+check "no dialog" dialogs 0
+check "nothing written inside the directory" test -z "$(ls -A "$HOME/.f7/sealed/capture.lock")"
+
 # ------------------------------------------------------------------ other adapters
 
 echo "other adapters"
@@ -496,9 +505,14 @@ check "rotate exit 0" rc_is 0
 check "same credential" out_is "n8n-cred:my-cred (id=cred-0)"
 check "one credential" test "$(jq length "$C/dest/n8n.json")" == 1
 check "rotated, other data kept" test "$(jq -r '.[0].data.value + "|" + .[0].data.name' "$C/dest/n8n.json")" == "sc-test-n8n-2|X-Key"
+printf '{"credentials": []}' > "$C/dest/n8n-list-override.json"
+SC_FAKE_N8N_LIST="$C/dest/n8n-list-override.json" capture --target n8n --instance t --name my-cred --type httpHeaderAuth
+check "a list in another shape fails loudly: exit 7" rc_is 7
+check "says it could not tell" err_has "not verified whether"
+check "list shape refused before the dialog" dialogs 2
 capture --target n8n --instance t --name other --type httpHeaderAuth --rotate
 check "rotate missing: exit 7" rc_is 7
-check "rotate missing before the dialog" dialogs 2
+check "rotate missing before the dialog" dialogs 2  # unchanged since the rotate
 check "no leak" no_leak sc-test-n8n sc-test-n8n-2 sc-test-apikey
 
 echo
