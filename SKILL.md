@@ -190,9 +190,9 @@ Every successful invocation prints **only a reference string** on stdout. The ag
 # Good — the agent invokes the skill, gets a reference, uses the reference
 ref=$(bash capture.sh --target keychain --service anthropic-cli --account $(whoami))
 # → ref = "keychain:anthropic-cli"
-# Later, when consuming:
-security find-generic-password -s anthropic-cli -w | some-cli --stdin
-# The value flows through a pipe; the agent still never sees it.
+# Later, a script consumes it (the agent runs the script, never this line):
+#   security find-generic-password -s anthropic-cli -w | some-cli --stdin
+# The value flows through a pipe inside the script; the agent never sees it.
 ```
 
 ## Error codes (stderr)

@@ -38,9 +38,10 @@ When validating that a rotation worked, it is easy to accidentally leak the new 
 
 Safe verification of a rotation:
 
-1. **Field parity** — `op item get ... --format=json | jq '[.fields[].label] | sort'` before and after; compare for equality. No values printed.
-2. **Target field is non-empty** — `op read "op://Vault/Item/field" >/dev/null 2>&1 && echo ok || echo empty`. Uses exit code only.
-3. **End-to-end sanity** — use the value in the actual consumer (HTTP API call, CLI command) with the value substituted inline from `op read` piped to the consumer's stdin or header. If the consumer returns 200, the rotation is real.
+1. **Field parity and a non-empty target** — `scripts/verify-1password.sh <vault> <item> <field>` before and after: it prints the item's sorted field labels (no values), then `ok` or `empty` for the target field. Compare the label lists for equality. Exit 2 is "not verified", never "empty".
+2. **End-to-end sanity** — a script feeds the value to the actual consumer (HTTP API call, CLI command): it reads it with `op read` or `op run` inside and pipes it to the consumer's stdin or header. The agent runs the script and reads only the consumer's status. If the consumer returns 200, the rotation is real.
+
+Agents type no `op read`, `op item get --reveal` or `--format=json`: the shell gate refuses them (2026-11-14). Secrets stay inside scripts.
 
 Never print `.value`, `.value[0:N]`, or `.value | length` for the rotated field.
 
