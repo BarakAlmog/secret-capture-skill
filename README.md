@@ -151,7 +151,7 @@ Every adapter emits a **reference** — never the value:
 | `n8n` | `n8n-cred:<name> (id=<id>)` |
 | `env-file` | `env-file:<path>#<key>` |
 
-The agent uses the reference to consume the secret later (e.g., `op read "op://Personal/anthropic-key/credential"`), without the skill ever holding the value in memory again.
+A script consumes the secret later through the reference (it runs `op read "op://Personal/anthropic-key/credential"` or `op run` inside), so neither the skill nor the agent holds the value again. To check a capture or a rotation without seeing the value: `scripts/verify-1password.sh <vault> <item> <field>`.
 
 ## Rotation
 
