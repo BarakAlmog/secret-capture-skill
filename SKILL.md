@@ -44,9 +44,20 @@ Requires `f7` (`f7 secret seal|open`) and `jq` on PATH.
 The dialog's output is piped straight into `f7 secret seal capture`: encrypted to this Mac's Secure Enclave, at `~/.f7/sealed/capture.sealed`. Adapters pipe it back out with `f7 secret open capture` into the destination's stdin. There is one slot, overwritten by every capture, so nothing piles up.
 
 - **Write landed** → the slot is deleted.
-- **Write failed** (any adapter error after the paste) → the slot is kept, and stderr says `HELD: ... rerun the same command with --reuse`. Fix the cause, then rerun with `--reuse`: the held value is written and **no dialog opens**. You may change other flags on the rerun (add `--rotate`, fix a vault name); the held value must have the same fields (one value, or the same `--field` names), or `--reuse` refuses with `USAGE_ERROR` and keeps it.
-- Without `--reuse`, a held value is replaced by the new paste.
-- A lock (`~/.f7/sealed/capture.lock`) keeps two captures off the slot at once: the second exits `BUSY` (10). A lock whose process is gone is taken over.
+- **Write failed** (any adapter error after the paste) → the slot is kept, and stderr says `HELD: ... rerun the same command with --reuse`. Fix the cause, then rerun the same command with `--reuse`: the held value is written and **no dialog opens**.
+- The slot is sealed with its destination: `--target` and every target flag, `--field` included. `--reuse` writes only to that same destination; any other flag set is refused with `USAGE_ERROR` (the slot is kept). Only `--rotate`, `--expect` and `--prompt` may change on the rerun.
+- Without `--reuse`, a new capture discards the held value before its dialog opens, so a cancelled or failed capture leaves nothing for a later `--reuse`.
+- A lock (`~/.f7/sealed/capture.lock`, a symlink to the holder's pid) keeps two captures off the slot at once: the second exits `BUSY` (10). A lock whose process is gone is taken over; a capture only ever removes its own lock.
+
+## What "success" means per target
+
+Every target is checked before the dialog: flags, config and API key, reachability, duplicate (create) or missing record (rotate). After the write:
+
+| Read back and compared with the slot (SHA-256) | Exit code only: the destination never returns the value |
+|---|---|
+| `1password`, `keychain`, `env-file`, `ssh`, `coolify` | `gh-secret`, `wrangler`, `n8n` |
+
+A read-back that does not match fails with `stored value differs`: either the write did not land, or the destination changed the value on save (whitespace, line endings). The value stays held, but a `--reuse` would store the same thing again: check the destination by hand.
 
 ## Targets
 
@@ -60,7 +71,7 @@ bash capture.sh --target 1password \
 
 `--category` accepts the canonical UPPERCASE_UNDERSCORE template id (`API_CREDENTIAL`, `LOGIN`, `PASSWORD`, `DATABASE`, `SECURE_NOTE`, `SERVER`) or a human-readable equivalent (`"API Credential"`, `"api-credential"`) — the adapter normalizes to the canonical form before passing to `op item create`. Default: `API_CREDENTIAL`. Refused before the dialog: any other category, `PASSWORD` without `--field password` (its built-in field), `LOGIN` without `--field username:visible --field password`.
 
-`--rotate` edits the item **in place**: same ID, every other field, the notes, tags and URLs kept. The adapter never trusts `op`'s exit code: after every write it reads the item back and compares the stored values with the slot by SHA-256 (nothing printed). A write `op` reported as failed but that landed (this service account has returned a 404 on an edit that applied) succeeds with a `WARNING`; a write that did not land fails with the value held. Before the dialog it checks the vault is reachable, the item exists (rotate) or does not (create), the title names one active item, and every `--field` is on it (rotate).
+`--rotate` edits the item **in place**: same ID, every other field, the notes, tags and URLs kept. The adapter never trusts `op`'s exit code: after every write it reads the item back and compares the stored values with the slot by SHA-256 (nothing printed). A write `op` reported as failed but that landed (this service account has returned a 404 on an edit that applied) succeeds with a `WARNING`; a write that did not land, or a value 1Password stored differently, fails with the value held. Before the dialog it checks the vault is reachable, the item exists (rotate) or does not (create), the title names one active item, and every `--field` is on it (rotate).
 
 Returns: `op://<vault>/<item>/<field>`
 
@@ -135,12 +146,12 @@ Uses Coolify REST directly (bypasses MCP — the MCP response echoes the value b
 ### `n8n`
 
 ```bash
-bash capture.sh --target n8n --instance <instance-alias> --name <cred-name> --type <credential-type> [--data-field <field-name>]
+bash capture.sh --target n8n --instance <instance-alias> --name <cred-name> --type <credential-type> [--data-field <field-name>] [--fields-json '<json>'] [--rotate]
 ```
 
 Returns: `n8n-cred:<name> (id=<id>)`
 
-Instance alias is looked up in the user's config (URL + API key). Credential type matches n8n's type name (e.g., `anthropicApi`, `httpHeaderAuth`, `openAiApi`).
+Instance alias is looked up in the user's config (URL + API key). Credential type matches n8n's type name (e.g., `anthropicApi`, `httpHeaderAuth`, `openAiApi`). The credential is found by name and type (`GET /api/v1/credentials`, which never returns secrets): create refuses a duplicate, `--rotate` updates it by id (`PATCH`, `isPartialData`, so its other data fields stay). Needs an n8n whose public API lists credentials.
 
 ### `env-file`
 
@@ -192,7 +203,7 @@ Pass `--expect <shape>` to sanity-check the captured value before writing:
 bash capture.sh --target 1password --vault Personal --item openai-key --field credential --expect openai
 ```
 
-Shapes supported out of the box: `openai`, `anthropic`, `github-pat`, `aws-access-key`, `stripe`, `cloudflare-token`, `slack`. Advisory only: a mismatch prints `WARNING` on stderr and the value is stored anyway. A guessed shape never drops a paste. Before the dialog opens, the pattern is looked up and an adapter that supports `SC_CHECK` (1password) checks its destination: vault reachable, duplicate, rotate target. Nothing that can fail without the value fails after the user pastes.
+Shapes supported out of the box: `openai`, `anthropic`, `github-pat`, `aws-access-key`, `stripe`, `cloudflare-token`, `slack`. Advisory only: a mismatch prints `WARNING` on stderr and the value is stored anyway. A guessed shape never drops a paste. Before the dialog opens, the pattern is looked up and every adapter checks its destination (`SC_CHECK`): flags, config, reachability, duplicate, rotate target. Nothing that can fail without the value fails after the user pastes.
 
 ## Return values
 
@@ -216,7 +227,7 @@ ref=$(bash capture.sh --target keychain --service anthropic-cli --account $(whoa
 - `AUTH_FAIL` — destination auth failed; fix credentials and retry
 - `DUPLICATE` — item exists; re-invoke with `--rotate` or pick a different name
 - `FORMAT_MISMATCH` — `--expect` names an unknown pattern (checked before the dialog)
-- `ADAPTER_ERROR` — subcommand failed, or a write could not be verified ("not verified"); check adapter preflight
+- `ADAPTER_ERROR` — subcommand failed, a write could not be verified ("not verified"), or `stored value differs` after a read-back
 - `NOT_FOUND` — `--rotate` target (item or field) does not exist
 - `BUSY` — another capture holds the sealed slot (exit 10)
 - `HELD` — not an error of its own: after any failure past the dialog, the value is held; rerun with `--reuse`
@@ -230,7 +241,7 @@ None of these ever contain the value.
 - Value never in shell history
 - Value never in any stdout the agent sees
 - Value never in a plain-text file: dialog → `f7 secret seal` → `f7 secret open` → destination, through pipes only. The one file is the slot, sealed to the Secure Enclave; it is deleted after a write that landed. (`env-file` and `ssh` targets are files by definition: see above.) A 1Password item revealed for an in-place rotation moves through pipes and this process's memory, never a file.
-- `scripts/lint-adapters.sh` enforces it: it fails on `mktemp`, a redirect into a file, `tee`, `curl -o <file>`, `op --template`/`--out-file`, a `--reveal` that is not piped on, and a dialog script that writes a file. `tests/run.sh` runs every adapter but keychain end to end with stubs and fails if a value reaches stdout, stderr, TMPDIR or any file outside the destination.
+- `scripts/lint-adapters.sh` enforces it: it fails on `mktemp`, a redirect into a file, `tee`, `curl -o <file>`, `op --template`/`--out-file`, a `--reveal` that is not piped on, a `<<<` here-string or unquoted heredoc (bash 3.2 backs both with a temp file), and a dialog script that writes a file. `tests/run.sh` runs every adapter but keychain end to end with stubs and fails if a value reaches stdout, stderr, TMPDIR or any file outside the destination.
 
 ## Do NOT
 

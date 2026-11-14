@@ -49,7 +49,7 @@ Usage:
 Two or more --field flags open one window with a box per field (1password only);
 ":visible" shows that box as typed (a username), every other box is hidden.
 
---reuse writes the value held from a failed run instead of opening the dialog.
+--reuse writes the value held from a failed run of the same destination, without a dialog.
 
 Targets: 1password | keychain | gh-secret | wrangler | coolify | n8n | env-file | ssh
 
@@ -153,14 +153,17 @@ if [[ -z "$MULTI" ]]; then
 fi
 
 # Nothing that can fail without the value may fail after the user pastes it.
-# The pattern is looked up now, and an adapter that supports SC_CHECK checks
-# its destination now (reachable, duplicate, rotate target, category), with no value.
+# The pattern is looked up now, and every adapter checks its flags, config and
+# destination now (SC_CHECK=1: reachable, duplicate, rotate target), with no value.
 if [[ -n "$EXPECT" ]]; then
   lookup_pattern "$EXPECT" >/dev/null || exit $?
 fi
-if grep -q 'SC_CHECK' "$ADAPTER_SCRIPT"; then
-  SC_CHECK=1 SC_MULTI="$MULTI" ROTATE="$ROTATE" SKILL_ROOT="$SKILL_ROOT" bash "$ADAPTER_SCRIPT" ${ADAPTER_ARGS[@]+"${ADAPTER_ARGS[@]}"} </dev/null || exit $?
-fi
+SC_CHECK=1 SC_MULTI="$MULTI" ROTATE="$ROTATE" SKILL_ROOT="$SKILL_ROOT" bash "$ADAPTER_SCRIPT" ${ADAPTER_ARGS[@]+"${ADAPTER_ARGS[@]}"} </dev/null || exit $?
+
+# The destination this value is for: the target and its flags (--rotate, --reuse, --expect
+# and --prompt aside). It is sealed with the value, and --reuse writes only to the same one.
+# NUL-separated into jq, so a flag like --vault is data, not a jq option.
+DEST=$(printf '%s\0' "$TARGET" ${ADAPTER_ARGS[@]+"${ADAPTER_ARGS[@]}"} | jq -cRs 'split("\u0000") | .[:-1]')
 
 slot_lock || exit $?
 trap slot_unlock EXIT
@@ -168,23 +171,31 @@ trap slot_unlock EXIT
 if [[ -n "$REUSE" ]]; then
   slot_exists \
     || { echo "USAGE_ERROR: --reuse, but no value is held; run without --reuse to open the dialog" >&2; exit 2; }
-  if ! slot_has "${SLOT_KEYS[@]}"; then
-    held=$(slot_keys) || held="(the slot did not open, above)"
-    echo "USAGE_ERROR: the held value has the keys [$held], this command needs [${SLOT_KEYS[*]}]; run without --reuse to capture again" >&2
+  held=$(slot_dest) \
+    || { echo "ADAPTER_ERROR: the held value does not open (f7 secret open, above)" >&2; exit 7; }
+  if [[ "$held" != "$DEST" ]]; then
+    echo "USAGE_ERROR: the held value was captured for $held, not $DEST; --reuse writes it only to the same destination. Run without --reuse to capture again" >&2
     exit 2
   fi
+  slot_has "${SLOT_KEYS[@]}" \
+    || { echo "ADAPTER_ERROR: the held value is missing [${SLOT_KEYS[*]}]; run without --reuse to capture again" >&2; exit 7; }
   echo "NOTE: writing the value held since $(slot_since); no dialog" >&2
 else
-  slot_exists && echo "NOTE: a value held from an earlier failed capture is replaced by this one" >&2
-  # The dialog's stdout goes straight into the slot. Exit codes are read per stage: a
-  # cancelled dialog prints nothing, and slot_seal then seals nothing.
+  # A new capture discards any held value first, so a cancelled, empty or failed capture
+  # leaves nothing behind for a later --reuse.
+  if slot_exists; then
+    echo "NOTE: discarding the value held from an earlier failed capture" >&2
+    slot_delete
+  fi
+  # The dialog's stdout goes straight into the slot, wrapped with its destination. Exit
+  # codes are read per stage: a cancelled dialog prints nothing, and nothing is sealed.
   set +e
-  dialog_capture "secret-capture" "${DIALOG_BOXES[@]}" | slot_seal
+  dialog_capture "secret-capture" "${DIALOG_BOXES[@]}" | jq -c --argjson d "$DEST" '{dest: $d, values: .}' | slot_seal
   stages=("${PIPESTATUS[@]}")
   set -e
   (( stages[0] == 0 )) || exit "${stages[0]}"
-  (( stages[1] == 0 )) \
-    || { echo "ADAPTER_ERROR: the value could not be sealed (f7 secret seal, above); paste it again" >&2; exit 7; }
+  (( stages[1] == 0 && stages[2] == 0 )) \
+    || { echo "ADAPTER_ERROR: the value could not be sealed (above); paste it again" >&2; exit 7; }
   slot_has "${SLOT_KEYS[@]}" \
     || { echo "ADAPTER_ERROR: the sealed slot does not open to the captured value (above); paste it again" >&2; exit 7; }
 fi
@@ -203,6 +214,6 @@ if SC_MULTI="$MULTI" ROTATE="$ROTATE" SKILL_ROOT="$SKILL_ROOT" bash "$ADAPTER_SC
   exit 0
 else
   rc=$?
-  echo "HELD: the value stays sealed in $SC_SLOT_FILE. Fix the cause above, then rerun the same command with --reuse: no new paste." >&2
+  echo "HELD: the value stays sealed in $SC_SLOT_FILE. Fix the cause above, then rerun the same command with --reuse: no new paste. A new capture without --reuse discards it." >&2
   exit "$rc"
 fi

@@ -19,7 +19,7 @@ trap 'rm -rf "$ROOT"' EXIT
 
 PATH="$STUBS:$PATH"
 export PATH
-unset OP_SERVICE_ACCOUNT_TOKEN SC_FAKE_OP_FAIL SC_FAKE_F7_FAIL SC_TEST_DIALOG SC_FAKE_HTTP_STATUS
+unset OP_SERVICE_ACCOUNT_TOKEN SC_FAKE_OP_FAIL SC_FAKE_F7_FAIL SC_TEST_DIALOG SC_FAKE_HTTP_STATUS SC_FAKE_SSH_DOWN SC_FAKE_COOLIFY_MANGLE
 
 for tool in osascript f7 op gh wrangler ssh curl yq; do
   [[ "$(command -v "$tool")" == "$STUBS/$tool" ]] \
@@ -48,7 +48,7 @@ fresh() {   # fresh <case name> — a clean world for one case
   C="$ROOT/$case_n"
   mkdir -p "$C/home" "$C/tmp" "$C/dest/op/f7-test" "$C/dest/remote"
   export HOME="$C/home" TMPDIR="$C/tmp" SC_TEST_DIR="$C" SC_TEST_DEST="$C/dest" SC_FAKE_OP_DIR="$C/dest/op"
-  unset SC_FAKE_OP_FAIL SC_FAKE_F7_FAIL SC_TEST_DIALOG SC_FAKE_HTTP_STATUS
+  unset SC_FAKE_OP_FAIL SC_FAKE_F7_FAIL SC_TEST_DIALOG SC_FAKE_HTTP_STATUS SC_FAKE_SSH_DOWN SC_FAKE_COOLIFY_MANGLE SC_TEST_API_KEY
   echo "- $CASE"
 }
 
@@ -114,6 +114,8 @@ check "refuses --reveal into a variable" lint_refuses 'x=$(op item get "$i" --re
 check "refuses tee"                   lint_refuses 'slot_value value | tee /tmp/x | gh secret set N'
 check "refuses curl -o file"          lint_refuses 'curl -sS -o "$out" https://x'
 check "refuses op --template"         lint_refuses 'op item create --template "$f"'
+check "refuses a here-string"         lint_refuses 'gh secret set N <<<"$(slot_value value)"'
+check "refuses an unquoted heredoc"   lint_refuses $'cat <<EOF | gh secret set N\n$(slot_value value)\nEOF'
 check "refuses a dialog writing a file" bash -c "printf 'x.writeToFileAtomicallyEncodingError(p, true, 4, null)\n' > '$fixture/scripts/lib/dialog-many.js'; printf '#!/usr/bin/env bash\ntrue\n' > '$fixture/scripts/adapters/bad.sh'; ! bash '$REPO/scripts/lint-adapters.sh' '$fixture' >/dev/null"
 cp "$REPO/scripts/lib/dialog-many.js" "$fixture/scripts/lib/"
 check "allows an annotated destination write" bash -c "printf '#!/usr/bin/env bash\nslot_value value > \"\$f\"  # sc-allow-file: test\n' > '$fixture/scripts/adapters/ok.sh'; bash '$REPO/scripts/lint-adapters.sh' '$fixture' >/dev/null"
@@ -227,7 +229,7 @@ seed_item item-w sc-w API_CREDENTIAL "$OLD_FIELDS"
 export SC_TEST_ANSWERS='{"value":"sc-test-want"}'
 SC_FAKE_OP_FAIL=edit-wrong capture --target 1password --vault f7-test --item sc-w --field credential --rotate
 check "exit 7" rc_is 7
-check "says it does not hold the value" err_has "does not hold the captured value"
+check "says the stored value differs, and why" err_has "stored value differs"
 check "slot held" slot_held
 check "no leak" no_leak sc-test-want
 
@@ -305,26 +307,50 @@ capture --target 1password --vault f7-test --item sc-n --reuse
 check "exit 2" rc_is 2
 check "no dialog" dialogs 0
 
-fresh "--reuse with a value held for other fields"
-export SC_TEST_ANSWERS='{"username":"sc-test-u","password":"sc-test-p"}'
-SC_FAKE_OP_FAIL=create capture --target 1password --vault f7-test --item sc-h --category LOGIN --field username:visible --field password
+fresh "--reuse with a value held for another destination"
+export SC_TEST_ANSWERS='{"value":"sc-test-for-a"}'
+SC_FAKE_OP_FAIL=create capture --target 1password --vault f7-test --item sc-for-a
 check "first run fails, held" slot_held
-capture --target 1password --vault f7-test --item sc-h --field credential --reuse
+capture --target 1password --vault f7-test --item sc-for-b --reuse
 check "exit 2" rc_is 2
-check "names the held keys" err_has "username, password"
+check "names both destinations" err_has '"sc-for-a"'
 check "slot still held" slot_held
-check "no write" op_writes 1
+check "no second write" op_writes 1
+capture --target 1password --vault f7-test --item sc-for-a --field credential --reuse
+check "other flags (here --field) count as another destination" rc_is 2
+capture --target 1password --vault f7-test --item sc-for-a --reuse
+check "the same destination takes it" rc_is 0
+check "written to A" test "$(field sc-for-a credential)" == sc-test-for-a
+check "no leak" no_leak sc-test-for-a
+
+fresh "a new capture discards a held value; a cancelled one leaves none"
+export SC_TEST_ANSWERS='{"value":"sc-test-held-old"}'
+SC_FAKE_OP_FAIL=create capture --target 1password --vault f7-test --item sc-old
+check "held" slot_held
+SC_TEST_DIALOG=cancel capture --target 1password --vault f7-test --item sc-old
+check "cancelled" rc_is 4
+check "says it discarded the held value" err_has "discarding the value held"
+check "nothing held after the cancel" slot_gone
+capture --target 1password --vault f7-test --item sc-old --reuse
+check "--reuse finds nothing" rc_is 2
+check "no leak" no_leak sc-test-held-old
+
+fresh "--title is refused"
+capture --target 1password --vault f7-test --item sc-ti --title other-name
+check "exit 2" rc_is 2
+check "no dialog" dialogs 0
 
 fresh "lock held by a live capture"
-mkdir -p "$HOME/.f7/sealed/capture.lock"
+mkdir -p "$HOME/.f7/sealed"
 sleep 30 &
 holder=$!
-printf '%s\n' "$holder" > "$HOME/.f7/sealed/capture.lock/pid"
+ln -s "$holder" "$HOME/.f7/sealed/capture.lock"
 export SC_TEST_ANSWERS='{"value":"sc-test-busy"}'
 capture --target 1password --vault f7-test --item sc-b
 check "exit 10" rc_is 10
 check "BUSY" err_has "BUSY"
 check "no dialog" dialogs 0
+check "the other capture's lock is left alone" test "$(readlink "$HOME/.f7/sealed/capture.lock")" == "$holder"
 kill "$holder"
 wait "$holder" 2>/dev/null || true
 capture --target 1password --vault f7-test --item sc-b
@@ -334,6 +360,11 @@ check "no leak" no_leak sc-test-busy
 # ------------------------------------------------------------------ other adapters
 
 echo "other adapters"
+
+fresh "gh-secret: missing flag refused before the dialog"
+capture --target gh-secret --scope repo --name API_KEY
+check "exit 2" rc_is 2
+check "no dialog" dialogs 0
 
 fresh "gh-secret"
 export SC_TEST_ANSWERS='{"value":"sc-test-gh"}'
@@ -359,8 +390,8 @@ printf 'OTHER=keep-me\nAPI_KEY=old\n' > "$envf"
 export SC_TEST_ANSWERS="{\"value\":\"sc-test-env 'q' \$HOME\"}"
 capture --target env-file --file "$envf" --key API_KEY
 check "duplicate without --rotate" rc_is 6
-check "held after the duplicate" slot_held
-capture --target env-file --file "$envf" --key API_KEY --rotate --reuse
+check "refused before the dialog" dialogs 0
+capture --target env-file --file "$envf" --key API_KEY --rotate
 check "exit 0" rc_is 0
 check "value round-trips through the shell" test "$(envfile_value "$envf" API_KEY)" == "sc-test-env 'q' \$HOME"
 check "other line kept" test "$(envfile_value "$envf" OTHER)" == keep-me
@@ -385,6 +416,17 @@ check "one line for the key" test "$(grep -c '^DB_PASS=' "$remote")" == 1
 check "mode 600" test "$(stat -f %Lp "$remote")" == 600
 check "no leak" no_leak "sc-test-ssh 'q'" sc-test-ssh-2
 
+fresh "ssh: duplicate and unreachable host refused before the dialog"
+remote="$C/dest/remote/app.env"
+printf 'DB_PASS=old\n' > "$remote"
+capture --target ssh --ssh-host box --mode file-kv --remote-path "$remote" --key DB_PASS
+check "duplicate exit 6" rc_is 6
+check "no dialog" dialogs 0
+SC_FAKE_SSH_DOWN=1 capture --target ssh --ssh-host box --mode file-raw --remote-path "$C/dest/remote/k"
+check "unreachable exit 7" rc_is 7
+check "ssh's own error shown" err_has "Connection refused"
+check "no dialog" dialogs 0
+
 fresh "ssh file-raw"
 export SC_TEST_ANSWERS='{"value":"sc-test-raw"}'
 capture --target ssh --ssh-host box --mode file-raw --remote-path "$C/dest/remote/key.pem"
@@ -408,7 +450,26 @@ check "exit 0" rc_is 0
 check "PATCH on rotate" test "$(<"$C/dest/http/0.method")" == PATCH
 check "body carries the value" test "$(jq -r .value "$C/dest/http/0.body")" == sc-test-cool
 check "token header through a pipe" grep -qF "authorization: Bearer sc-test-apikey" "$C/dest/http/0.headers"
+check "read back with a GET" test "$(<"$C/dest/http/1.method")" == GET
 check "no leak" no_leak sc-test-cool sc-test-apikey
+
+fresh "coolify stores a different value -> stored value differs, held"
+http_config
+export SC_TEST_ANSWERS='{"value":"sc-test-mangled"}'
+SC_FAKE_COOLIFY_MANGLE=1 capture --target coolify --coolify-instance t --app-uuid u1 --key DB_URL
+check "exit 7" rc_is 7
+check "stored value differs" err_has "stored value differs"
+check "slot held" slot_held
+check "no leak" no_leak sc-test-mangled
+
+fresh "coolify: config and API key checked before the dialog"
+capture --target coolify --coolify-instance t --app-uuid u1 --key DB_URL
+check "no config: exit 9" rc_is 9
+http_config
+unset SC_TEST_API_KEY
+capture --target coolify --coolify-instance t --app-uuid u1 --key DB_URL
+check "unresolvable API key: exit 9" rc_is 9
+check "no dialog" dialogs 0
 
 fresh "coolify HTTP 422 -> held"
 http_config
@@ -424,9 +485,21 @@ http_config
 export SC_TEST_ANSWERS='{"value":"sc-test-n8n"}'
 capture --target n8n --instance t --name my-cred --type httpHeaderAuth --fields-json '{"name":"X-Key"}'
 check "exit 0" rc_is 0
-check "reference with id" out_is "n8n-cred:my-cred (id=cred-1)"
-check "body" test "$(jq -r '.data.value + "|" + .data.name' "$C/dest/http/0.body")" == "sc-test-n8n|X-Key"
-check "no leak" no_leak sc-test-n8n sc-test-apikey
+check "reference with id" out_is "n8n-cred:my-cred (id=cred-0)"
+check "stored" test "$(jq -r '.[0].data.value + "|" + .[0].data.name' "$C/dest/n8n.json")" == "sc-test-n8n|X-Key"
+capture --target n8n --instance t --name my-cred --type httpHeaderAuth
+check "duplicate exit 6" rc_is 6
+check "refused before the dialog" dialogs 1
+export SC_TEST_ANSWERS='{"value":"sc-test-n8n-2"}'
+capture --target n8n --instance t --name my-cred --type httpHeaderAuth --rotate
+check "rotate exit 0" rc_is 0
+check "same credential" out_is "n8n-cred:my-cred (id=cred-0)"
+check "one credential" test "$(jq length "$C/dest/n8n.json")" == 1
+check "rotated, other data kept" test "$(jq -r '.[0].data.value + "|" + .[0].data.name' "$C/dest/n8n.json")" == "sc-test-n8n-2|X-Key"
+capture --target n8n --instance t --name other --type httpHeaderAuth --rotate
+check "rotate missing: exit 7" rc_is 7
+check "rotate missing before the dialog" dialogs 2
+check "no leak" no_leak sc-test-n8n sc-test-n8n-2 sc-test-apikey
 
 echo
 echo "SKIPPED: keychain (would write the real login keychain); the TTY fallback (needs a terminal)."

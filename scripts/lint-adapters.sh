@@ -7,12 +7,12 @@
 #     values, is never written to a file. It moves through pipes, from the sealed slot
 #     (lib/slot.sh) into the destination's stdin. Refused: mktemp, a `>`/`>>` redirect to
 #     anything but /dev/null, /dev/stderr, /dev/stdout, /dev/tty or a descriptor, tee, curl
-#     -o/--output to a file, op --template/--out-file, --reveal not piped straight on, and a
-#     dialog script that writes a file.
+#     -o/--output to a file, op --template/--out-file, --reveal not piped straight on, a
+#     `<<<` here-string or an unquoted heredoc (bash 3.2 backs both with a temp file, and
+#     they can carry an expanded value), and a dialog script that writes a file.
 #
 # A redirect that must write a file says why on the same line: `# sc-allow-file: <reason>`.
-# Today: env-file's destination (a .env file is plain text by definition) and the slot
-# lock's pid.
+# Today: env-file's destination (a .env file is plain text by definition).
 #
 # Usage: lint-adapters.sh [<skill-root>]   (default: this script's repo; tests pass a fixture)
 # Exit 0 — clean. Exit 1 — one or more violations, printed on stdout.
@@ -114,6 +114,7 @@ logical_lines() {
       # A heredoc (<<TAG, <<\047TAG\047, <<-TAG; not a <<< here-string): skip its body.
       if (match(raw, /(^|[^<])<<-?[[:space:]]*[\047"]?[A-Za-z_]+/)) {
         tag = substr(raw, RSTART, RLENGTH)
+        if (tag !~ /[\047"]/) code = code " UNQUOTED_HEREDOC"
         sub(/^[^<]?<<-?[[:space:]]*[\047"]?/, "", tag)
         heredoc = tag
       }
@@ -152,6 +153,12 @@ for f in "${shell_files[@]}"; do
     fi
     if [[ "$code" =~ (--template|--out-file)([[:space:]=]|$) ]]; then
       emit "op template file: pipe the template on stdin (op item create/edit -)" "$f" "$lineno" "$code"
+    fi
+    if [[ "$code" == *'<<<'* ]]; then
+      emit "here-string: bash 3.2 writes it to a temp file; pipe it (printf '%s' ... |)" "$f" "$lineno" "$code"
+    fi
+    if [[ "$code" == *UNQUOTED_HEREDOC* ]]; then
+      emit "unquoted heredoc: it expands values, and bash 3.2 writes it to a temp file; quote the tag (<<'X') or pipe" "$f" "$lineno" "$code"
     fi
     piped="${code//||/ OR }"   # `cmd || fallback` is not a pipe
     if [[ "$code" == *--reveal* ]] && ! [[ "$piped" =~ --reveal[^|]*\| ]]; then

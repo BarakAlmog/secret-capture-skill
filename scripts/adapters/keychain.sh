@@ -46,6 +46,10 @@ if security find-generic-password -s "$SERVICE" -a "$ACCOUNT" >/dev/null 2>&1; t
   fi
 fi
 
+# SC_CHECK=1: capture.sh runs this before the dialog, with no value. Flags and the
+# duplicate check are done.
+[[ -n "${SC_CHECK:-}" ]] && exit 0
+
 # The expect script is passed with -c (it holds no secret), so expect's stdin is free for the
 # value, piped out of the sealed slot (lib/slot.sh). SC_ACCOUNT and SC_SERVICE reach the
 # expect process via env — they are NOT secrets. The value only lives in expect's Tcl memory
@@ -68,11 +72,22 @@ expect {
   timeout { exit 7 }
 }
 set val ""
+lassign [wait] pid spawn_id os_error status
+if {$os_error != 0} { exit 7 }
+exit $status
 '
+# expect waits for `security` and exits with its status.
 if ! slot_value value | SC_ACCOUNT="$ACCOUNT" SC_SERVICE="$SERVICE" expect -c "$TCL" >/dev/null; then
   echo "ADAPTER_ERROR: expect-driven 'security add-generic-password' failed" >&2
   exit 7
 fi
+
+# Read back: `security ... -w` prints the stored value and a newline; compare digests.
+want=$({ slot_value value; printf '\n'; } | shasum -a 256) \
+  || { echo "ADAPTER_ERROR: not verified: the sealed slot did not open (above)" >&2; exit 7; }
+got=$(security find-generic-password -s "$SERVICE" -a "$ACCOUNT" -w | shasum -a 256) \
+  || { echo "ADAPTER_ERROR: not verified: could not read keychain entry '$SERVICE' back (above)" >&2; exit 7; }
+readback_matches "$want" "$got" "keychain entry '$SERVICE'" || exit $?
 
 # --silent-read: open the item's ACL partition list to Apple-signed CLI tools so a
 # background reader (e.g. /usr/bin/security inside an MCP-launch wrapper) gets the value

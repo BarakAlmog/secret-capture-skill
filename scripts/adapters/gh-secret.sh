@@ -31,26 +31,20 @@ done
 [[ -z "$NAME" ]] && { echo "USAGE_ERROR: --name required" >&2; exit 2; }
 
 case "$SCOPE" in
-  repo)
-    [[ -z "$REPO" ]] && { echo "USAGE_ERROR: --repo required for scope=repo" >&2; exit 2; }
-    slot_value value | gh secret set "$NAME" --repo "$REPO" >/dev/null \
-      || { echo "ADAPTER_ERROR: gh secret set failed (above)" >&2; exit 7; }
-    printf 'gh-secret:%s#%s\n' "$REPO" "$NAME"
-    ;;
-  org)
-    [[ -z "$ORG" ]] && { echo "USAGE_ERROR: --org required for scope=org" >&2; exit 2; }
-    slot_value value | gh secret set "$NAME" --org "$ORG" --visibility "$VISIBILITY" >/dev/null \
-      || { echo "ADAPTER_ERROR: gh secret set failed (above)" >&2; exit 7; }
-    printf 'gh-secret:org/%s#%s\n' "$ORG" "$NAME"
-    ;;
-  env)
-    [[ -z "$REPO" || -z "$ENV_NAME" ]] && { echo "USAGE_ERROR: --repo and --env required for scope=env" >&2; exit 2; }
-    slot_value value | gh secret set "$NAME" --repo "$REPO" --env "$ENV_NAME" >/dev/null \
-      || { echo "ADAPTER_ERROR: gh secret set failed (above)" >&2; exit 7; }
-    printf 'gh-secret:%s/env/%s#%s\n' "$REPO" "$ENV_NAME" "$NAME"
-    ;;
-  *)
-    echo "USAGE_ERROR: --scope must be repo|org|env" >&2
-    exit 2
-    ;;
+  repo) [[ -n "$REPO" ]] || { echo "USAGE_ERROR: --repo required for scope=repo" >&2; exit 2; }
+        DEST=(--repo "$REPO"); REF="$REPO#$NAME" ;;
+  org)  [[ -n "$ORG" ]] || { echo "USAGE_ERROR: --org required for scope=org" >&2; exit 2; }
+        DEST=(--org "$ORG" --visibility "$VISIBILITY"); REF="org/$ORG#$NAME" ;;
+  env)  [[ -n "$REPO" && -n "$ENV_NAME" ]] || { echo "USAGE_ERROR: --repo and --env required for scope=env" >&2; exit 2; }
+        DEST=(--repo "$REPO" --env "$ENV_NAME"); REF="$REPO/env/$ENV_NAME#$NAME" ;;
+  *)    echo "USAGE_ERROR: --scope must be repo|org|env" >&2; exit 2 ;;
 esac
+
+# SC_CHECK=1: capture.sh runs this before the dialog, with no value.
+[[ -n "${SC_CHECK:-}" ]] && exit 0
+
+# Write-only: GitHub never returns a secret's value, so success is gh's exit code alone.
+slot_value value | gh secret set "$NAME" "${DEST[@]}" >/dev/null \
+  || { echo "ADAPTER_ERROR: gh secret set failed (above)" >&2; exit 7; }
+
+printf 'gh-secret:%s\n' "$REF"

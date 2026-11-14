@@ -24,6 +24,10 @@ done
 [[ -z "$WORKER" ]] && { echo "USAGE_ERROR: --worker required" >&2; exit 2; }
 [[ -z "$NAME" ]]   && { echo "USAGE_ERROR: --name required" >&2; exit 2; }
 
+# SC_CHECK=1: capture.sh runs this before the dialog, with no value.
+[[ -n "${SC_CHECK:-}" ]] && exit 0
+
+# Write-only: Cloudflare never returns a secret's value, so success is wrangler's exit code.
 slot_value value \
   | jq -cRs --arg name "$NAME" '{ ($name): . }' \
   | wrangler secret bulk --name "$WORKER" >/dev/null \

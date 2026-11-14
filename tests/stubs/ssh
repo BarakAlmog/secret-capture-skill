@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # Test stub for ssh: runs the remote command in a local shell (the "remote host" is the
 # test's directory tree). Skips -o <opt> and -T, takes the first other word as the host.
+#   SC_FAKE_SSH_DOWN=1   every connection fails with exit 255, like an unreachable host
 set -euo pipefail
+if [[ -n "${SC_FAKE_SSH_DOWN:-}" ]]; then
+  echo "ssh: connect to host: Connection refused (injected)" >&2
+  exit 255
+fi
 while (( $# > 0 )); do
   case "$1" in
     -o) shift 2 ;;

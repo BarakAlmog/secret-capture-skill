@@ -34,23 +34,37 @@ FILE="${FILE/#\~/$HOME}"
 ROTATE="${ROTATE:-}"
 
 umask 077
+[[ -d "$(dirname "$FILE")" ]] || { echo "USAGE_ERROR: the directory of $FILE does not exist" >&2; exit 2; }
 if [[ -f "$FILE" ]] && grep -Eq "^${KEY}=" "$FILE"; then
   [[ -n "$ROTATE" ]] || { echo "DUPLICATE: $KEY already set in $FILE; pass --rotate to overwrite" >&2; exit 6; }
 fi
 
+# SC_CHECK=1: capture.sh runs this before the dialog, with no value.
+[[ -n "${SC_CHECK:-}" ]] && exit 0
+
+# The KEY='value' line, with each ' in the value written '\''.
+LINE_JQ='$k + "=" + $q + gsub($q; $q + "\\" + $q + $q) + $q + "\n"'
+
 next="${FILE}.sc-new"
 trap 'rm -f "$next"' EXIT
 
-# Every other line of the old file, then KEY='value' with each ' in the value written '\''.
+# Every other line of the old file, then the KEY='value' line, last.
 {
   if [[ -f "$FILE" ]]; then
     grep -Ev "^${KEY}=" "$FILE" || [[ $? -eq 1 ]]
   fi
-  slot_value value | jq -jRs --arg k "$KEY" --arg q "'" '$k + "=" + $q + gsub($q; $q + "\\" + $q + $q) + $q + "\n"'
+  slot_value value | jq -jRs --arg k "$KEY" --arg q "'" "$LINE_JQ"
 } > "$next"  # sc-allow-file: the destination itself, renamed over it below
 
 chmod 600 "$next"
 mv "$next" "$FILE"
 trap - EXIT
+
+# Read back: from the KEY= line to the end of the file is the line written above.
+want=$(slot_value value | jq -jRs --arg k "$KEY" --arg q "'" "$LINE_JQ" | shasum -a 256) \
+  || { echo "ADAPTER_ERROR: not verified: the sealed slot did not open (above)" >&2; exit 7; }
+got=$(sed -n "/^${KEY}=/,\$p" "$FILE" | shasum -a 256) \
+  || { echo "ADAPTER_ERROR: not verified: could not read $FILE back (above)" >&2; exit 7; }
+readback_matches "$want" "$got" "$FILE" || exit $?
 
 printf 'env-file:%s#%s\n' "$FILE" "$KEY"

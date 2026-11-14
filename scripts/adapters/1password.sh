@@ -45,7 +45,6 @@ VAULT=""
 ITEM=""
 FIELDS=()
 CATEGORY="API_CREDENTIAL"
-TITLE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -53,14 +52,12 @@ while [[ $# -gt 0 ]]; do
     --item) ITEM="$2"; shift 2 ;;
     --field) FIELDS+=("$2"); shift 2 ;;
     --category) CATEGORY="$(normalize_category "$2")"; shift 2 ;;
-    --title) TITLE="$2"; shift 2 ;;
     *) echo "USAGE_ERROR: unknown arg '$1'" >&2; exit 2 ;;
   esac
 done
 
 [[ -z "$VAULT" ]] && { echo "USAGE_ERROR: --vault required" >&2; exit 2; }
 [[ -z "$ITEM" ]]  && { echo "USAGE_ERROR: --item required" >&2; exit 2; }
-[[ -z "$TITLE" ]] && TITLE="$ITEM"
 (( ${#FIELDS[@]} > 0 )) || FIELDS=(credential)
 ROTATE="${ROTATE:-}"
 SC_MULTI="${SC_MULTI:-}"
@@ -112,7 +109,7 @@ find_item_id() {
   local listing ids=()
   listing=$(op item list --vault "$VAULT" --format json | jq -r --arg t "$ITEM" '[.[] | select(.title == $t) | .id] | join(" ")') \
     || { echo "ADAPTER_ERROR: could not list vault '$VAULT' (above)" >&2; return 7; }
-  read -r -a ids <<<"$listing"
+  [[ -n "$listing" ]] && read -r -a ids < <(printf '%s\n' "$listing")
   case "${#ids[@]}" in
     0) ;;
     1) printf '%s\n' "${ids[0]}" ;;
@@ -125,9 +122,9 @@ HELD_DEF='def held($v; $k): $v[$k] | if type == "string" and length > 0 then . e
 
 # verify <id> — 0 when the item's target fields hold exactly the slot's values, 1 when they
 # do not, 2 when that could not be checked ("not verified"). Compares SHA-256 digests.
+want="" got=""
 verify() {
-  local want got
-  want=$(slot_open | jq -cS --argjson specs "$SPECS" '. as $v | [$specs[] | {(.name): $v[.key]}] | add' | shasum -a 256) \
+  want=$(slot_open | jq -cS --argjson specs "$SPECS" '.values as $v | [$specs[] | {(.name): $v[.key]}] | add' | shasum -a 256) \
     || return 2
   got=$(op item get "$1" --vault "$VAULT" --format json --reveal | jq -cS --argjson specs "$SPECS" '.fields as $f | [$specs[] | .name as $n | {($n): ([$f[] | select(.id == $n or .label == $n) | .value] | first)}] | add' | shasum -a 256) \
     || return 2
@@ -140,7 +137,13 @@ settle() {
   verify "$1" || v=$?
   case "$v" in
     0) [[ -z "$2" ]] || echo "WARNING: 1Password reported a failure (above), but item $1 holds the new value (verified)" >&2 ;;
-    1) echo "ADAPTER_ERROR: item $1 does not hold the captured value after the write" >&2; exit 7 ;;
+    1)
+      if [[ -n "$2" ]]; then
+        echo "ADAPTER_ERROR: the write did not land: 1Password reported a failure (above) and item $1 does not hold the captured value" >&2
+        exit 7
+      fi
+      readback_matches "$want" "$got" "1Password item $1" || exit $?
+      ;;
     *) echo "ADAPTER_ERROR: not verified: item $1 could not be read back (above)" >&2; exit 7 ;;
   esac
 }
@@ -155,7 +158,7 @@ if [[ -n "${SC_CHECK:-}" ]]; then
   [[ -n "$id" ]] || { echo "NOT_FOUND: item '$ITEM' is not in vault '$VAULT'; nothing to rotate" >&2; exit 7; }
   set +e
   op item get "$id" --vault "$VAULT" --format json \
-    | jq -e --argjson specs "$SPECS" '([$specs[].name] - [.fields[] | .id, .label]) as $m | if ($m | length) > 0 then ("NOT_FOUND: field(s) not on item '" + .title + "': " + ($m | join(", ")) + "\n" | halt_error(7)) else true end' >/dev/null
+    | jq -e --argjson specs "$SPECS" '([$specs[].name] - [.fields[] | .id, .label]) as $m | if ($m | length) > 0 then ("NOT_FOUND: field(s) not on item " + .title + ": " + ($m | join(", ")) + "\n" | halt_error(7)) else true end' >/dev/null
   st=("${PIPESTATUS[@]}")
   set -e
   (( st[0] == 0 )) || { echo "ADAPTER_ERROR: could not read item '$ITEM' (above)" >&2; exit 7; }
@@ -169,8 +172,8 @@ op_failed=""
 if [[ -z "$ROTATE" ]]; then
   check_category || exit $?
   [[ -z "$id" ]] || { echo "DUPLICATE: item '$ITEM' exists in vault '$VAULT'; pass --rotate to overwrite" >&2; exit 6; }
-  template=$(slot_open | jq -c --arg title "$TITLE" --arg cat "$CATEGORY" --argjson specs "$SPECS" "$HELD_DEF"'
-    . as $v
+  template=$(slot_open | jq -c --arg title "$ITEM" --arg cat "$CATEGORY" --argjson specs "$SPECS" "$HELD_DEF"'
+    .values as $v
     | {title: $title, category: $cat,
        fields: [$specs[] | {id: .name, label: .name, type: .type, value: held($v; .key)} + (if .purpose == "" then {} else {purpose: .purpose} end)]}') \
     || { echo "ADAPTER_ERROR: could not build the item from the sealed slot (above)" >&2; exit 7; }
@@ -184,7 +187,7 @@ if [[ -z "$ROTATE" ]]; then
 else
   [[ -n "$id" ]] || { echo "NOT_FOUND: item '$ITEM' is not in vault '$VAULT'; nothing to rotate" >&2; exit 7; }
   template=$(op item get "$id" --vault "$VAULT" --format json --reveal | jq -c --argjson specs "$SPECS" --slurpfile slot <(slot_open) "$HELD_DEF"'
-    ($slot[0] // {}) as $v
+    ($slot[0].values // {}) as $v
     | ([$specs[].name] - [.fields[] | .id, .label]) as $missing
     | if ($missing | length) > 0 then error("field(s) not on the item: \($missing | join(", "))") else . end
     | .fields |= map(. as $f
