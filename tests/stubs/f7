@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Test stub for `f7 secret seal|open <name>`, same contract as the real one (stdin trimmed,
+# empty refused, "Sealed: ..." on stdout, open prints with no newline), files in
+# $HOME/.f7/sealed/<name>.sealed. NOT encrypted: base64 only, for fake test values.
+#   SC_FAKE_F7_FAIL=seal  -> seal fails
+set -euo pipefail
+
+[[ "${1:-}" == secret ]] || { echo "f7 stub: only 'secret seal|open'" >&2; exit 2; }
+cmd="${2:-}" name="${3:-}"
+dir="$HOME/.f7/sealed"
+file="$dir/$name.sealed"
+
+case "$cmd" in
+  seal)
+    [[ "${SC_FAKE_F7_FAIL:-}" == seal ]] && { echo "f7 stub: seal failed (injected)" >&2; exit 1; }
+    value=$(cat)
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    [[ -n "$value" ]] || { echo "error: Nothing to seal on stdin." >&2; exit 1; }
+    mkdir -p "$dir"
+    printf '%s' "$value" | base64 > "$file"
+    echo "Sealed: $name -> $file"
+    ;;
+  open)
+    [[ -f "$file" ]] || { echo "error: No sealed secret \"$name\" in $dir" >&2; exit 1; }
+    base64 -d < "$file"
+    ;;
+  *) echo "f7 stub: unknown 'secret $cmd'" >&2; exit 2 ;;
+esac

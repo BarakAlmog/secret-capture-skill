@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Test stub for osascript: stands in for the capture dialog, opens no window.
+# Only answers `osascript -l JavaScript <...>/dialog-many.js <title> <key> <label> <mode>...`.
+#   SC_TEST_DIALOG=cancel        -> CANCELLED, exit 4
+#   SC_TEST_ANSWERS='{"k":"v"}'  -> prints {"<key>": answers[key], ...} for the asked keys
+# Counts calls in $SC_TEST_DIR/dialog-count.
+set -euo pipefail
+
+if [[ "${1:-}" != -l || "${2:-}" != JavaScript || "${3:-}" != */dialog-many.js ]]; then
+  echo "osascript stub: refusing anything but the capture dialog: $*" >&2
+  exit 99
+fi
+shift 4   # -l JavaScript <script> <title>
+
+count=0
+[[ -f "$SC_TEST_DIR/dialog-count" ]] && count=$(<"$SC_TEST_DIR/dialog-count")
+printf '%s\n' "$((count + 1))" > "$SC_TEST_DIR/dialog-count"
+
+if [[ "${SC_TEST_DIALOG:-}" == cancel ]]; then
+  echo "CANCELLED" >&2
+  exit 4
+fi
+
+keys=()
+while (( $# >= 3 )); do keys+=("$1"); shift 3; done
+jq -cj --args '. as $a | [$ARGS.positional[] | {(.): $a[.]}] | add' "${keys[@]}" <<<"${SC_TEST_ANSWERS:?SC_TEST_ANSWERS not set}"

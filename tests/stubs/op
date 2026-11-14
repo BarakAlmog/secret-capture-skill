@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# Test stub for the 1Password CLI, backed by JSON files in $SC_FAKE_OP_DIR/<vault>/<id>.json
+# (a fake destination holding fake values). Mirrors what the adapter relies on, as checked
+# against op 2.39 on 2026-11-14:
+#   item list --vault V --format json        [{id, title, ...}], no field values
+#   item get <id|title> --vault V --format json [--reveal]   values included either way
+#   item create --vault V --format json -    template on stdin; prints the item
+#   item edit <id> --vault V --format json   template on stdin REPLACES the field list
+#   vault get V
+# A PASSWORD item without a password-purpose field is refused, like the real one.
+# Fault injection, SC_FAKE_OP_FAIL (comma-separated):
+#   create        create fails, nothing made
+#   create-lies   create applies, then exits 1
+#   edit          edit fails, nothing changed
+#   edit-404      edit applies, then reports "(404) Not Found" and exits 1
+#   edit-wrong    edit stores a different value than asked, exits 0
+# Every call is logged in $SC_FAKE_OP_DIR/calls.
+set -euo pipefail
+
+root="${SC_FAKE_OP_DIR:?SC_FAKE_OP_DIR not set}"
+printf '%s\n' "$*" >> "$root/calls"
+
+fail_has() { [[ ",${SC_FAKE_OP_FAIL:-}," == *",$1,"* ]]; }
+
+vault="" format="" reveal="" args=()
+while (( $# > 0 )); do
+  case "$1" in
+    --vault) vault="$2"; shift 2 ;;
+    --vault=*) vault="${1#*=}"; shift ;;
+    --format) format="$2"; shift 2 ;;
+    --format=*) format="${1#*=}"; shift ;;
+    --reveal) reveal=1; shift ;;
+    --archive) args+=(--archive); shift ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+set -- "${args[@]}"
+
+vdir="$root/$vault"
+need_vault() {
+  [[ -n "$vault" && -d "$vdir" ]] || { echo "[ERROR] \"$vault\" isn't a vault in this account." >&2; exit 1; }
+}
+
+# resolve <id|title> — the item's file, or exit 1 like op.
+resolve() {
+  local ref="$1" f hits=()
+  [[ -f "$vdir/$ref.json" ]] && { printf '%s\n' "$vdir/$ref.json"; return; }
+  for f in "$vdir"/*.json; do
+    [[ -e "$f" ]] || continue
+    [[ "$(jq -r .title "$f")" == "$ref" ]] && hits+=("$f")
+  done
+  case "${#hits[@]}" in
+    1) printf '%s\n' "${hits[0]}" ;;
+    0) echo "[ERROR] \"$ref\" isn't an item in the \"$vault\" vault." >&2; exit 1 ;;
+    *) echo "[ERROR] More than one item matches \"$ref\"." >&2; exit 1 ;;
+  esac
+}
+
+check_template() {
+  jq -e 'if .category == "PASSWORD" and ([.fields[]? | select(.purpose == "PASSWORD")] | length) == 0
+         then ("[ERROR] Password item requires ps value\n" | halt_error(1)) else true end' >/dev/null
+}
+
+case "${1:-} ${2:-}" in
+  "vault get")
+    vault="$3"; vdir="$root/$vault"; need_vault
+    jq -nc --arg v "$vault" '{id: $v, name: $v}'
+    ;;
+  "item list")
+    need_vault
+    for f in "$vdir"/*.json; do if [[ -e "$f" ]]; then jq -c '{id, title, category}' "$f"; fi; done | jq -cs .
+    ;;
+  "item get")
+    need_vault
+    f=$(resolve "$3")
+    cat "$f"
+    ;;
+  "item create")
+    need_vault
+    [[ "${3:-}" == - ]] || { echo "op stub: create only from stdin" >&2; exit 2; }
+    tpl=$(cat)
+    printf '%s' "$tpl" | check_template
+    fail_has create && { echo "[ERROR] create failed (injected)" >&2; exit 1; }
+    id="item$(ls "$vdir" | wc -l | tr -d ' ')x$RANDOM"
+    printf '%s' "$tpl" | jq --arg id "$id" '{id: $id, title, category, version: 1, fields: (.fields // [])}' > "$vdir/$id.json"
+    fail_has create-lies && { echo "[ERROR] (500) Internal Server Error (injected)" >&2; exit 1; }
+    cat "$vdir/$id.json"
+    ;;
+  "item edit")
+    need_vault
+    f=$(resolve "$3")
+    [[ "$3" == "$(jq -r .id "$f")" ]] || { echo "[ERROR] (404) Not Found (edit by name, like the service account)" >&2; exit 1; }
+    tpl=$(cat)
+    [[ -n "$tpl" ]] || { echo "op stub: edit with an empty template" >&2; exit 2; }
+    fail_has edit && { echo "[ERROR] edit failed (injected)" >&2; exit 1; }
+    filter='. as $old | $tpl | {id: $old.id, title: (.title // $old.title), category: $old.category, version: ($old.version + 1), fields: (.fields // [])}'
+    fail_has edit-wrong && filter="$filter"' | .fields |= map(if .type == "CONCEALED" then .value = "sc-test-wrong" else . end)'
+    next=$(jq --argjson tpl "$tpl" "$filter" "$f")
+    printf '%s\n' "$next" > "$f"
+    fail_has edit-404 && { echo "[ERROR] 2026/11/14 12:00:00 (404) Not Found (injected)" >&2; exit 1; }
+    cat "$f"
+    ;;
+  "item delete")
+    need_vault
+    f=$(resolve "$3")
+    rm -f "$f"
+    ;;
+  *) echo "op stub: unsupported: ${args[*]}" >&2; exit 2 ;;
+esac

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Test stub for curl as the coolify and n8n adapters call it. Records each request in
+# $SC_TEST_DEST/http/<n>.{method,url,headers,body} (a fake destination) and answers
+# {"id":"cred-1"} with status $SC_FAKE_HTTP_STATUS (default 200). --fail on a status >= 400
+# exits 22 with curl's message.
+set -euo pipefail
+method=GET url="" out="" fail="" body_from="" headers=()
+while (( $# > 0 )); do
+  case "$1" in
+    -sS|-s|-S) shift ;;
+    --fail) fail=1; shift ;;
+    -X) method="$2"; shift 2 ;;
+    -H) headers+=("$2"); shift 2 ;;
+    --data-binary) body_from="$2"; shift 2 ;;
+    -o) out="$2"; shift 2 ;;
+    -*) echo "curl stub: unsupported flag $1" >&2; exit 2 ;;
+    *) url="$1"; shift ;;
+  esac
+done
+dir="$SC_TEST_DEST/http"
+mkdir -p "$dir"
+n=$(ls "$dir" | grep -c '\.url$' || true)
+printf '%s\n' "$method" > "$dir/$n.method"
+printf '%s\n' "$url" > "$dir/$n.url"
+for h in "${headers[@]}"; do
+  if [[ "$h" == @* ]]; then cat "${h#@}"; else printf '%s\n' "$h"; fi
+done > "$dir/$n.headers"
+[[ "$body_from" == @- ]] && cat > "$dir/$n.body"
+
+status="${SC_FAKE_HTTP_STATUS:-200}"
+if (( status >= 400 )) && [[ -n "$fail" ]]; then
+  echo "curl: (22) The requested URL returned error: $status" >&2
+  exit 22
+fi
+response='{"id":"cred-1"}'
+if [[ -n "$out" ]]; then printf '%s' "$response" > "$out"; else printf '%s' "$response"; fi
