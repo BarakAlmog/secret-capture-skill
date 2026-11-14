@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Adapter: n8n credential (via REST).
-# Uses the n8n public API: POST /api/v1/credentials. Response redacts password-type
-# fields — safe surface. Request body built via jq with --rawfile (never in argv).
+# Uses the n8n public API: POST /api/v1/credentials. Request body built by jq on a pipe
+# (never in argv or a file).
 #
 # Stdout: n8n-cred:<name> (id=<id>)
 #
@@ -12,6 +12,8 @@ set -euo pipefail
 
 # shellcheck source=../lib/config.sh
 source "${SKILL_ROOT:?SKILL_ROOT not set}/scripts/lib/config.sh"
+# shellcheck source=../lib/slot.sh
+source "$SKILL_ROOT/scripts/lib/slot.sh"
 
 INSTANCE=""
 CRED_NAME=""
@@ -43,48 +45,86 @@ URL=$(config_get "defaults.n8n.instances.${INSTANCE}.url")
 API_KEY_SOURCE=$(config_get "defaults.n8n.instances.${INSTANCE}.api_key_source")
 [[ -n "$API_KEY_SOURCE" ]] || { echo "CONFIG_ERROR: defaults.n8n.instances.${INSTANCE}.api_key_source not set" >&2; exit 9; }
 
-umask 077
-body=$(mktemp -t sc-n8n-body-XXXXXX)
-auth=$(mktemp -t sc-n8n-auth-XXXXXX)
-out=$(mktemp -t sc-n8n-out-XXXXXX)
-cleanup() {
-  shred -u "$body" "$auth" "$out" 2>/dev/null || true
-  rm -f "$body" "$auth" "$out"
+ROTATE="${ROTATE:-}"
+key_bytes=$(resolve_source "$API_KEY_SOURCE" | wc -c) \
+  || { echo "CONFIG_ERROR: defaults.n8n.instances.${INSTANCE}.api_key_source did not resolve (above)" >&2; exit 9; }
+(( key_bytes > 0 )) \
+  || { echo "CONFIG_ERROR: defaults.n8n.instances.${INSTANCE}.api_key_source resolved to nothing" >&2; exit 9; }
+printf '%s' "$FIELDS_JSON" | jq -e 'type == "object"' >/dev/null \
+  || { echo "USAGE_ERROR: --fields-json must be a JSON object" >&2; exit 2; }
+
+CREDS_URL="${URL%/}/api/v1/credentials"
+
+# find_cred_id — the id of the credential named $CRED_NAME of type $CRED_TYPE, or nothing.
+# GET /credentials lists names and types, never secrets (n8n public API), page by page.
+find_cred_id() {
+  local cursor="" page page_ids ids="" query
+  while :; do
+    query="limit=250"
+    [[ -n "$cursor" ]] && query="$query&cursor=$(jq -rn --arg c "$cursor" '$c | @uri')"
+    page=$(curl -sS --fail "$CREDS_URL?$query" \
+             -H @<(printf 'X-N8N-API-KEY: '; resolve_source "$API_KEY_SOURCE"; printf '\n')) \
+      || { echo "ADAPTER_ERROR: could not list n8n credentials (GET /api/v1/credentials, above)" >&2; return 7; }
+    # A page in another shape fails here, loudly: it must never read as "no duplicate".
+    printf '%s' "$page" | jq -e '(.data | type) == "array" and (.data | all(type == "object" and (.id | type) == "string"))' >/dev/null \
+      || { echo "ADAPTER_ERROR: n8n's credential list is not {data: [{id, name, type}...]}; not verified whether '$CRED_NAME' exists" >&2; return 7; }
+    page_ids=$(printf '%s' "$page" | jq -r --arg n "$CRED_NAME" --arg t "$CRED_TYPE" '[.data[] | select(.name == $n and .type == $t) | .id] | join(" ")') \
+      || { echo "ADAPTER_ERROR: could not read n8n's credential list (above)" >&2; return 7; }
+    ids="$ids $page_ids"
+    cursor=$(printf '%s' "$page" | jq -r '.nextCursor // empty') \
+      || { echo "ADAPTER_ERROR: could not read n8n's credential list cursor (above)" >&2; return 7; }
+    [[ -n "$cursor" ]] || break
+  done
+  local found=()
+  read -r -a found < <(printf '%s\n' "$ids")
+  case "${#found[@]}" in
+    0) ;;
+    1) printf '%s\n' "${found[0]}" ;;
+    *) echo "ADAPTER_ERROR: ${#found[@]} n8n credentials are named '$CRED_NAME' ($CRED_TYPE): ${found[*]}; keep one" >&2; return 7 ;;
+  esac
 }
-trap cleanup EXIT
 
-{ printf 'X-N8N-API-KEY: '; resolve_source "$API_KEY_SOURCE"; printf '\n'; } > "$auth"
-
-jq -n \
-  --arg name "$CRED_NAME" \
-  --arg type "$CRED_TYPE" \
-  --arg field "$DATA_FIELD" \
-  --argjson extra "$FIELDS_JSON" \
-  --rawfile v /dev/stdin \
-  '{
-    name: $name,
-    type: $type,
-    data: ($extra + { ($field): ($v | rtrimstr("\n")) })
-  }' > "$body"
-
-http_code=$(curl -sS -X POST \
-  "${URL%/}/api/v1/credentials" \
-  -H @"$auth" \
-  -H 'content-type: application/json' \
-  --data @"$body" \
-  -o "$out" -w "%{http_code}")
-
-if [[ "$http_code" -lt 200 || "$http_code" -ge 300 ]]; then
-  echo "ADAPTER_ERROR: n8n HTTP $http_code" >&2
-  exit 7
+cred_id=$(find_cred_id) || exit $?
+if [[ -n "$ROTATE" ]]; then
+  [[ -n "$cred_id" ]] || { echo "NOT_FOUND: no n8n credential '$CRED_NAME' ($CRED_TYPE); nothing to rotate" >&2; exit 7; }
+else
+  [[ -z "$cred_id" ]] || { echo "DUPLICATE: n8n credential '$CRED_NAME' ($CRED_TYPE) exists (id=$cred_id); pass --rotate to overwrite" >&2; exit 6; }
 fi
 
-# n8n response redacts password-type fields — safe to parse .id out of the response.
-cred_id=$(jq -r '.id // empty' "$out" 2>/dev/null || true)
+# SC_CHECK=1: capture.sh runs this before the dialog, with no value.
+[[ -n "${SC_CHECK:-}" ]] && exit 0
 
-if [[ -z "$cred_id" ]]; then
+# The request body is built by jq from the value piped out of the sealed slot and handed to
+# curl on stdin; the API key reaches curl through a pipe (-H @<(...)). The response goes
+# straight into jq, which keeps only the credential's id. --fail turns a non-2xx status into
+# a non-zero exit. Rotate: PATCH by id with isPartialData, so the credential's other data
+# fields are kept. Write-only: n8n never returns credential data, so success is the HTTP
+# status alone.
+if [[ -n "$ROTATE" ]]; then
+  METHOD=PATCH; WRITE_URL="$CREDS_URL/$cred_id"
+  BODY_JQ='{ data: ($extra + { ($field): . }), isPartialData: true }'
+else
+  METHOD=POST; WRITE_URL="$CREDS_URL"
+  BODY_JQ='{ name: $name, type: $type, data: ($extra + { ($field): . }) }'
+fi
+written_id=$(
+  slot_value value \
+    | jq -c -Rs \
+        --arg name "$CRED_NAME" \
+        --arg type "$CRED_TYPE" \
+        --arg field "$DATA_FIELD" \
+        --argjson extra "$FIELDS_JSON" \
+        "$BODY_JQ" \
+    | curl -sS --fail -X "$METHOD" "$WRITE_URL" \
+        -H @<(printf 'X-N8N-API-KEY: '; resolve_source "$API_KEY_SOURCE"; printf '\n') \
+        -H 'content-type: application/json' \
+        --data-binary @- \
+    | jq -r '.id // empty'
+) || { echo "ADAPTER_ERROR: n8n write failed (above)" >&2; exit 7; }
+
+if [[ -z "$written_id" ]]; then
   echo "ADAPTER_ERROR: n8n response missing credential id" >&2
   exit 7
 fi
 
-printf 'n8n-cred:%s (id=%s)\n' "$CRED_NAME" "$cred_id"
+printf 'n8n-cred:%s (id=%s)\n' "$CRED_NAME" "$written_id"

@@ -5,6 +5,7 @@
 preflight_check() {
   local target="$1"
   shift
+  _pf_slot || return $?
   case "$target" in
     1password) _pf_1password ;;
     keychain) _pf_keychain ;;
@@ -16,6 +17,14 @@ preflight_check() {
     ssh) _pf_ssh ;;
     *) echo "USAGE_ERROR: no preflight for target '$target'" >&2; return 2 ;;
   esac
+}
+
+# Every target: the value waits in the sealed slot (lib/slot.sh), opened with f7 and read with jq.
+_pf_slot() {
+  command -v f7 >/dev/null \
+    || { echo "ADAPTER_ERROR: 'f7' not found; the sealed slot needs 'f7 secret seal'" >&2; return 7; }
+  command -v jq >/dev/null \
+    || { echo "ADAPTER_ERROR: 'jq' not found" >&2; return 7; }
 }
 
 _pf_ssh() {

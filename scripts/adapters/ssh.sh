@@ -8,9 +8,10 @@
 #   file-raw  Write the raw value (no KEY=) to a remote file. For PEM, cert,
 #             single-token destinations. --rotate required to overwrite.
 #
-# The value is piped end-to-end: capture.sh's tempfile → this script's stdin →
-# local tempfile (0600, shredded) → ssh stdin → remote `cat > tempfile` → remote atomic mv.
-# Never in argv, env, or shell variable.
+# The value is piped end-to-end: sealed slot (lib/slot.sh) → jq (file-kv builds the
+# KEY='value' line) → ssh stdin → remote `cat` into <path>.sc-new (umask 077) → remote
+# atomic mv. Never in a local file, argv, env, or shell variable. file-kv rebuilds the
+# remote file on the remote side: the old file's other lines never leave the host.
 #
 # Authentication: relies on your ssh-agent (1Password SSH Agent, system agent,
 # or similar). No private key file is ever read by this adapter. If the SSH
@@ -21,6 +22,9 @@
 #   file-raw → `ssh-file:<user>@<host>:<path>`
 
 set -euo pipefail
+
+# shellcheck source=../lib/slot.sh
+source "${SKILL_ROOT:?SKILL_ROOT not set}/scripts/lib/slot.sh"
 
 SSH_HOST=""
 SSH_USER=""
@@ -76,86 +80,82 @@ fi
 #   -T                            — no tty allocation (stdin is the secret)
 SSH_OPTS=(-o BatchMode=no -o ConnectTimeout=10 -T)
 
-# Connectivity preflight: a trivial remote command. If this fails, everything else will too.
-# </dev/null so ssh doesn't drain the stdin pipe (which carries the secret value).
-if ! ssh "${SSH_OPTS[@]}" "$SSH_TARGET" 'true' </dev/null >/dev/null 2>&1; then
-  echo "ADAPTER_ERROR: cannot ssh to $SSH_TARGET (check host, agent, and reachability)" >&2
-  exit 7
+# sq <text> — <text> as one single-quoted word for the remote shell.
+sq() {
+  local q="'"
+  printf "'%s'" "${1//$q/$q\\$q$q}"
+}
+
+if [[ "$MODE" == file-kv ]]; then
+  [[ "$KEY" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
+    || { echo "USAGE_ERROR: --key must be a shell variable name" >&2; exit 2; }
 fi
+
+R_PATH=$(sq "$REMOTE_PATH")
+R_NEW=$(sq "${REMOTE_PATH}.sc-new")
+R_MATCH=$(sq "^${KEY}=")
+# Remote: the new content arrives on stdin and lands in <path>.sc-new, then replaces <path>.
+# A failed step removes the half-written .sc-new.
+R_INSTALL="chmod $CHMOD $R_NEW && mv $R_NEW $R_PATH || { rm -f $R_NEW; exit 1; }"
+
+# Connectivity: a trivial remote command. </dev/null so ssh reads no stdin.
+ssh "${SSH_OPTS[@]}" "$SSH_TARGET" 'true' </dev/null >/dev/null \
+  || { echo "ADAPTER_ERROR: cannot ssh to $SSH_TARGET (check host, agent, and reachability; above)" >&2; exit 7; }
+
+# Existence probe. file-kv: 0 = KEY= line present. file-raw: 0 = file present.
+if [[ "$MODE" == file-kv ]]; then
+  probe="test -f $R_PATH || exit 1; grep -Eq $R_MATCH $R_PATH"
+  what="$KEY already set in $REMOTE_PATH"
+else
+  probe="test -f $R_PATH"
+  what="$REMOTE_PATH already exists"
+fi
+probe_rc=0
+ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "$probe" </dev/null || probe_rc=$?
+case "$probe_rc" in
+  0) [[ -n "$ROTATE" ]] || { echo "DUPLICATE: $what on $SSH_TARGET; pass --rotate to overwrite" >&2; exit 6; } ;;
+  1) ;;
+  *) echo "ADAPTER_ERROR: could not check $REMOTE_PATH on $SSH_TARGET (exit $probe_rc, above)" >&2; exit 7 ;;
+esac
+
+# SC_CHECK=1: capture.sh runs this before the dialog, with no value.
+[[ -n "${SC_CHECK:-}" ]] && exit 0
 
 umask 077
 
 case "$MODE" in
 
   file-kv)
-    # Existence probe — remote grep for the KEY. Exit status is what we care about.
-    # 0 = key found; 1 = file missing or key not present; anything else = remote error.
-    # </dev/null so the probe ssh doesn't drain the script's stdin (which has the value).
-    set +e
-    ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "grep -Eq '^${KEY}=' '$REMOTE_PATH' 2>/dev/null" </dev/null
-    probe_rc=$?
-    set -e
-
-    if [[ "$probe_rc" -eq 0 && -z "$ROTATE" ]]; then
-      echo "DUPLICATE: $KEY already set in $REMOTE_PATH on $SSH_TARGET; pass --rotate to overwrite" >&2
-      exit 6
-    fi
-
-    # Pull current remote file content (or empty). Strip any existing KEY= line.
-    current=$(mktemp -t sc-ssh-current-XXXXXX)
-    stripped=$(mktemp -t sc-ssh-stripped-XXXXXX)
-    trimmed=$(mktemp -t sc-ssh-trimmed-XXXXXX)
-    combined=$(mktemp -t sc-ssh-combined-XXXXXX)
-    cleanup_kv() { shred -u "$current" "$stripped" "$trimmed" "$combined" 2>/dev/null || rm -f "$current" "$stripped" "$trimmed" "$combined"; }
-    trap cleanup_kv EXIT
-
-    ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "cat '$REMOTE_PATH' 2>/dev/null || true" </dev/null > "$current"
-
-    awk -v key="$KEY" '$0 ~ "^" key "=" { next } { print }' "$current" > "$stripped"
-
-    # Capture the value from stdin into a tempfile, stripping the trailing newline
-    # that the dialog/pipeline appends. file-kv values must be single-line (dotenv
-    # constraint) — if you need multi-line values, use --mode file-raw instead.
-    # Uses awk to preserve internal newlines through read but chomp the last one.
-    # `RS="\x00"` makes awk consume the whole stream as one record.
-    awk 'BEGIN { RS="\x00" } { sub(/\n+$/, ""); printf "%s", $0 }' > "$trimmed"
-
-    # Build the final file: stripped content + new KEY='value' line.
-    # Single-quote the value; escape any embedded single quotes via sed.
-    {
-      cat "$stripped"
-      printf "%s='" "$KEY"
-      sed "s/'/'\\\\''/g" < "$trimmed"
-      printf "'\n"
-    } > "$combined"
-
-    # Atomic remote write: upload to temp, chmod, mv into place.
-    # The `.sc-new` suffix is predictable but is only on disk for the duration of ssh call.
-    ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
-      "umask 077 && cat > '${REMOTE_PATH}.sc-new' && chmod $CHMOD '${REMOTE_PATH}.sc-new' && mv '${REMOTE_PATH}.sc-new' '$REMOTE_PATH'" \
-      < "$combined" \
+    # jq builds KEY='value' (trailing newlines of the value dropped; each ' written '\'').
+    # The remote side keeps every other line of the old file and appends it, last.
+    LINE_JQ='$k + "=" + $q + (sub("\n+$"; "") | gsub($q; $q + "\\" + $q + $q)) + $q + "\n"'
+    slot_value value \
+      | jq -jRs --arg k "$KEY" --arg q "'" "$LINE_JQ" \
+      | ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
+          "umask 077; { if [ -f $R_PATH ]; then grep -Ev $R_MATCH $R_PATH || [ \$? -eq 1 ]; fi && cat; } > $R_NEW && $R_INSTALL" \
       || { echo "ADAPTER_ERROR: remote write failed on $SSH_TARGET:$REMOTE_PATH" >&2; exit 7; }
+
+    # Read back: from the KEY= line to the end of the file is the line written above.
+    want=$(slot_value value | jq -jRs --arg k "$KEY" --arg q "'" "$LINE_JQ" | shasum -a 256) \
+      || { echo "ADAPTER_ERROR: not verified: the sealed slot did not open (above)" >&2; exit 7; }
+    got=$(ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "sed -n '/^${KEY}=/,\$p' $R_PATH" </dev/null | shasum -a 256) \
+      || { echo "ADAPTER_ERROR: not verified: could not read $REMOTE_PATH back (above)" >&2; exit 7; }
+    readback_matches "$want" "$got" "$SSH_TARGET:$REMOTE_PATH" || exit $?
 
     printf 'ssh-kv:%s:%s#%s\n' "$SSH_TARGET" "$REMOTE_PATH" "$KEY"
     ;;
 
   file-raw)
-    # Existence probe — does the file exist?
-    # </dev/null so the probe ssh doesn't drain the script's stdin.
-    set +e
-    ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "test -f '$REMOTE_PATH'" </dev/null
-    probe_rc=$?
-    set -e
-
-    if [[ "$probe_rc" -eq 0 && -z "$ROTATE" ]]; then
-      echo "DUPLICATE: $REMOTE_PATH already exists on $SSH_TARGET; pass --rotate to overwrite" >&2
-      exit 6
-    fi
-
-    # Atomic remote write: stdin → remote temp → chmod → mv.
-    ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
-      "umask 077 && cat > '${REMOTE_PATH}.sc-new' && chmod $CHMOD '${REMOTE_PATH}.sc-new' && mv '${REMOTE_PATH}.sc-new' '$REMOTE_PATH'" \
+    # Atomic remote write: slot → ssh stdin → remote .sc-new → chmod → mv.
+    slot_value value \
+      | ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "umask 077; cat > $R_NEW && $R_INSTALL" \
       || { echo "ADAPTER_ERROR: remote write failed on $SSH_TARGET:$REMOTE_PATH" >&2; exit 7; }
+
+    want=$(slot_digest value) \
+      || { echo "ADAPTER_ERROR: not verified: the sealed slot did not open (above)" >&2; exit 7; }
+    got=$(ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "cat $R_PATH" </dev/null | shasum -a 256) \
+      || { echo "ADAPTER_ERROR: not verified: could not read $REMOTE_PATH back (above)" >&2; exit 7; }
+    readback_matches "$want" "$got" "$SSH_TARGET:$REMOTE_PATH" || exit $?
 
     printf 'ssh-file:%s:%s\n' "$SSH_TARGET" "$REMOTE_PATH"
     ;;

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Test stub for `gh secret set NAME ...` (value on stdin) and `gh auth status`.
+# Stores each secret in $SC_TEST_DEST/gh/<NAME> (a fake destination).
+set -euo pipefail
+case "${1:-} ${2:-}" in
+  "auth status") exit 0 ;;
+  "secret set")
+    mkdir -p "$SC_TEST_DEST/gh"
+    cat > "$SC_TEST_DEST/gh/$3"
+    ;;
+  *) echo "gh stub: unsupported: $*" >&2; exit 2 ;;
+esac

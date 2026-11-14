@@ -1,24 +1,45 @@
 #!/usr/bin/env bash
-# Static check: every adapter must never put a secret value on argv, in an
-# exported env var, or emit it to stdout/stderr outside of the reference line.
-# Run after any adapter edit; also wired into the optional install-time check.
+# Static check over every script that touches a captured value: capture.sh, scripts/lib and
+# scripts/adapters. Two families of rules:
 #
-# Exit 0 — all adapters clean.
-# Exit 1 — one or more violations; lines printed on stderr.
+#   argv / env / stdout (adapters): a value never on argv, in an exported env var, or echoed.
+#   no plain text on disk (every script): a value, or a 1Password item revealed with its
+#     values, is never written to a file. It moves through pipes, from the sealed slot
+#     (lib/slot.sh) into the destination's stdin. Refused: mktemp, a `>`/`>>` redirect to
+#     anything but /dev/null, /dev/stderr, /dev/stdout, /dev/tty or a descriptor, tee, curl
+#     -o/--output to a file, op --template/--out-file, --reveal not piped straight on, a
+#     `<<<` here-string or an unquoted heredoc (bash 3.2 backs both with a temp file, and
+#     they can carry an expanded value), and a dialog script that writes a file.
+#
+# A redirect that must write a file says why on the same line: `# sc-allow-file: <reason>`.
+# Today: env-file's destination (a .env file is plain text by definition).
+#
+# Usage: lint-adapters.sh [<skill-root>]   (default: this script's repo; tests pass a fixture)
+# Exit 0 — clean. Exit 1 — one or more violations, printed on stdout.
 
 set -euo pipefail
 
-SKILL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SKILL_ROOT="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 ADAPTER_DIR="$SKILL_ROOT/scripts/adapters"
 
 violations=0
 
-# Forbidden regexes. Key is a short name, value is a bash-ERE pattern.
+emit() {
+  echo "FAIL: $1"
+  echo "   file: $2"
+  echo "   line: $3"
+  echo "   text: $4"
+  echo
+  violations=$((violations+1))
+}
+
+# ---------------------------------------------------------------- argv / env / stdout
+
 declare -a patterns=(
   # Literal value on argv via the --body / --value / --data flag.
   '--body[ =]"?\$' 'value flag with direct expansion'
   '--value[ =]"?\$' 'value flag with direct expansion'
-  '--data[ =]"?\$\{?[A-Za-z_]' 'data flag with shell var (use --data @file or --rawfile)'
+  '--data[ =]"?\$\{?[A-Za-z_]' 'data flag with shell var (pipe it: --data-binary @-)'
   # `-w $VAR` (macOS security and similar).
   '-w[ =]\$[A-Za-z_]' 'inline -w with shell var (use expect/pty or stdin)'
   # export of a value (leaks via /proc/<pid>/environ).
@@ -33,64 +54,154 @@ declare -a patterns=(
   'printf[[:space:]]+"\%s"[[:space:]]+"?\$[A-Za-z_]*VALUE' 'printf of a *VALUE variable'
 )
 
-emit() {
-  echo "FAIL: $1"
-  echo "   file: $2"
-  echo "   line: $3"
-  echo "   text: $4"
-  echo
-}
-
-# Iterate patterns two at a time (regex, description).
 n=${#patterns[@]}
 for ((i=0; i<n; i+=2)); do
   re="${patterns[i]}"
   desc="${patterns[i+1]}"
+  hits=$(grep -nE -e "$re" "$ADAPTER_DIR"/*.sh) || [[ $? -eq 1 ]]
   while IFS= read -r hit; do
     [[ -z "$hit" ]] && continue
     file="${hit%%:*}"
     rest="${hit#*:}"
-    lineno="${rest%%:*}"
-    text="${rest#*:}"
-    emit "$desc" "$file" "$lineno" "$text"
-    violations=$((violations+1))
-  done < <(grep -nE "$re" "$ADAPTER_DIR"/*.sh 2>/dev/null || true)
+    emit "$desc" "$file" "${rest%%:*}" "${rest#*:}"
+  done <<<"$hits"
 done
 
-# Positive checks: every adapter should redirect op/curl/wrangler success to /dev/null.
+# ---------------------------------------------------------------- no plain text on disk
+
+# logical_lines <file> — one line per shell command line: "<lineno>\t<allow>\t<code>".
+# Continuations are joined; comments, heredoc bodies and the inside of quotes are dropped
+# (a quoted word is kept as Q, so `> "$file"` still shows its target), and (( )) arithmetic
+# is dropped so its `>` is not read as a redirect. <allow> is 1 when the line carries
+# `# sc-allow-file:`.
+logical_lines() {
+  awk '
+    function flush() {
+      if (code != "" || allow) {
+        gsub(/\(\([^)]*\)\)/, "", code)
+        printf "%d\t%d\t%s\n", start, allow, code
+      }
+      code = ""; allow = 0; start = 0
+    }
+    {
+      raw = $0
+      if (heredoc != "") {
+        line = raw; sub(/^\t+/, "", line)
+        if (line == heredoc) heredoc = ""
+        next
+      }
+      if (start == 0) start = NR
+      if (raw ~ /# sc-allow-file:/) allow = 1
+      cont = 0
+      out = ""
+      n = length(raw)
+      for (i = 1; i <= n; i++) {
+        c = substr(raw, i, 1)
+        if (sq) { if (c == "\047") { sq = 0; out = out "Q" } ; continue }
+        if (dq) {
+          if (c == "\\") { i++; continue }
+          if (c == "\"") { dq = 0; out = out "Q" }
+          continue
+        }
+        if (c == "\\" && i == n) { cont = 1; break }
+        if (c == "\\") { out = out substr(raw, i, 2); i++; continue }
+        if (c == "\047") { sq = 1; continue }
+        if (c == "\"") { dq = 1; continue }
+        if (c == "#" && (i == 1 || substr(raw, i - 1, 1) ~ /[[:space:]]/)) break
+        out = out c
+      }
+      code = code " " out
+      # A heredoc (<<TAG, <<\047TAG\047, <<-TAG; not a <<< here-string): skip its body.
+      if (match(raw, /(^|[^<])<<-?[[:space:]]*[\047"]?[A-Za-z_]+/)) {
+        tag = substr(raw, RSTART, RLENGTH)
+        if (tag !~ /[\047"]/) code = code " UNQUOTED_HEREDOC"
+        sub(/^[^<]?<<-?[[:space:]]*[\047"]?/, "", tag)
+        heredoc = tag
+      }
+      if (!cont && !sq && !dq) flush()
+    }
+    END { flush() }
+  ' "$1"
+}
+
+shell_files=("$SKILL_ROOT/scripts/capture.sh" "$SKILL_ROOT"/scripts/lib/*.sh "$ADAPTER_DIR"/*.sh)
+
+safe_target='(/dev/(null|stderr|stdout|tty)([^A-Za-z0-9_/]|$)|&|\()'
+
+for f in "${shell_files[@]}"; do
+  while IFS=$'\t' read -r lineno allow code; do
+    if [[ "$code" =~ (^|[^A-Za-z0-9_-])mktemp([^A-Za-z0-9_-]|$) ]]; then
+      emit "mktemp: a temp file; keep the value in pipes" "$f" "$lineno" "$code"
+    fi
+    if [[ "$allow" != 1 ]]; then
+      rest="$code"
+      while [[ "$rest" =~ [\>][\>]?[[:space:]]*(.*)$ ]]; do
+        target="${BASH_REMATCH[1]}"
+        if ! [[ "$target" =~ ^$safe_target ]]; then
+          emit "redirect into a file (only /dev/null, /dev/stderr, /dev/tty or a descriptor)" "$f" "$lineno" "$code"
+          break
+        fi
+        rest="$target"
+      done
+    fi
+    if [[ "$code" =~ (^|[^A-Za-z0-9_-])tee([^A-Za-z0-9_-]|$) ]]; then
+      emit "tee writes a file" "$f" "$lineno" "$code"
+    fi
+    if [[ "$code" == *curl* && "$code" =~ (^|[[:space:]])(-o|--output)[[:space:]]+([^[:space:]]+) ]] \
+       && [[ "${BASH_REMATCH[3]}" != /dev/null ]]; then
+      emit "curl output into a file" "$f" "$lineno" "$code"
+    fi
+    if [[ "$code" =~ (--template|--out-file)([[:space:]=]|$) ]]; then
+      emit "op template file: pipe the template on stdin (op item create/edit -)" "$f" "$lineno" "$code"
+    fi
+    if [[ "$code" == *'<<<'* ]]; then
+      emit "here-string: bash 3.2 writes it to a temp file; pipe it (printf '%s' ... |)" "$f" "$lineno" "$code"
+    fi
+    if [[ "$code" == *UNQUOTED_HEREDOC* ]]; then
+      emit "unquoted heredoc: it expands values, and bash 3.2 writes it to a temp file; quote the tag (<<'X') or pipe" "$f" "$lineno" "$code"
+    fi
+    piped="${code//||/ OR }"   # `cmd || fallback` is not a pipe
+    if [[ "$code" == *--reveal* ]] && ! [[ "$piped" =~ --reveal[^|]*\| ]]; then
+      emit "--reveal not piped straight into the next command" "$f" "$lineno" "$code"
+    fi
+  done < <(logical_lines "$f")
+done
+
+for f in "$SKILL_ROOT"/scripts/lib/*.js; do
+  [[ -e "$f" ]] || continue
+  hits=$(grep -nE 'writeToFile|writeFile|createFileAtPath|NSFileManager' "$f") || [[ $? -eq 1 ]]
+  while IFS= read -r hit; do
+    [[ -z "$hit" ]] && continue
+    emit "dialog script writes a file; print the JSON to stdout" "$f" "${hit%%:*}" "${hit#*:}"
+  done <<<"$hits"
+done
+
+# ---------------------------------------------------------------- advisory
+
+# Every adapter should send op/curl/wrangler output to /dev/null or straight into jq.
 for f in "$ADAPTER_DIR"/*.sh; do
   name=$(basename "$f" .sh)
   case "$name" in
     env-file|keychain) continue ;;  # no network call / no response echo to worry about
   esac
-  # Look for op item create/edit or curl or wrangler invocations NOT followed by >/dev/null
-  # (rough check — prints a WARN, not a FAIL).
+  hits=$(grep -nE '(op item (create|edit)|curl -[sS]|wrangler secret)' "$f") || [[ $? -eq 1 ]]
   while IFS=: read -r lineno text; do
     [[ -z "$lineno" ]] && continue
-    # Skip comment lines (matching only documentation of the pattern).
     [[ "$text" =~ ^[[:space:]]*# ]] && continue
-    # Skip error-branch reporting lines (`|| { echo "ADAPTER_ERROR..." }`).
     [[ "$text" =~ ADAPTER_ERROR ]] && continue
-    if [[ "$text" =~ (op\ item\ (create|edit)|curl\ -[sS]|wrangler\ secret) ]] \
-       && ! [[ "$text" =~ /dev/null ]]; then
-      # Multi-line command — check next 10 lines (covers curl with backslashes).
-      end=$((lineno+10))
-      window=$(sed -n "${lineno},${end}p" "$f")
-      [[ "$window" =~ /dev/null ]] && continue
-      [[ "$window" == *'http_code='* ]] && continue  # n8n captures code separately
-      echo "WARN: potential un-redirected command"
-      echo "   file: $f"
-      echo "   line: $lineno"
-      echo "   text: $text"
-      echo
-    fi
-  done < <(grep -nE '(op item (create|edit)|curl -[sS]|wrangler secret)' "$f" 2>/dev/null || true)
+    window=$(sed -n "${lineno},$((lineno+10))p" "$f")
+    [[ "$window" =~ /dev/null || "$window" =~ \|[[:space:]]*jq ]] && continue
+    echo "WARN: potential un-redirected command"
+    echo "   file: $f"
+    echo "   line: $lineno"
+    echo "   text: $text"
+    echo
+  done <<<"$hits"
 done
 
 if (( violations > 0 )); then
-  echo "lint-adapters: $violations violation(s) across adapters" >&2
+  echo "lint-adapters: $violations violation(s)" >&2
   exit 1
 fi
 
-echo "lint-adapters: OK ($(ls "$ADAPTER_DIR"/*.sh | wc -l | tr -d ' ') adapters checked, 0 violations)"
-exit 0
+echo "lint-adapters: OK (${#shell_files[@]} scripts checked, 0 violations)"

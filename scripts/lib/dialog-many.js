@@ -1,14 +1,20 @@
-// One window, one box per field. Run by dialog_capture_many (dialog.sh) as:
-//   osascript -l JavaScript dialog-many.js <out-dir> <title> <label> <hidden|visible> [<label> <hidden|visible> ...]
-// Writes each value to <out-dir>/<n> (1-based, in field order) and prints "ok",
-// or prints "cancelled" and writes nothing. Values never reach stdout or stderr.
+// One window, one box per field. Run by dialog_capture (dialog.sh) as:
+//   osascript -l JavaScript dialog-many.js <title> <key> <label> <hidden|visible> [<key> <label> <hidden|visible> ...]
+// On Save, writes one JSON object {"<key>": "<value>", ...} to stdout, no newline, and exits 0.
+// The caller pipes that stdout straight into the sealed slot (`f7 secret seal capture`): no
+// value is written to a file. On Cancel, or a box left empty, writes nothing to stdout, says
+// why on stderr and exits 4.
 ObjC.import('Cocoa')
+ObjC.import('stdlib')
+
+function say(stream, text) {
+  stream.writeData($(text).dataUsingEncoding($.NSUTF8StringEncoding))
+}
 
 function run(argv) {
-  const outDir = argv[0]
-  const title = argv[1]
+  const title = argv[0]
   const specs = []
-  for (let i = 2; i + 1 < argv.length; i += 2) specs.push({ label: argv[i], visible: argv[i + 1] === 'visible' })
+  for (let i = 1; i + 2 < argv.length; i += 3) specs.push({ key: argv[i], label: argv[i + 1], visible: argv[i + 2] === 'visible' })
   if (specs.length === 0) throw new Error('USAGE_ERROR: no fields')
 
   const app = $.NSApplication.sharedApplication
@@ -53,11 +59,17 @@ function run(argv) {
   alert.window.orderFrontRegardless
   alert.window.makeKeyAndOrderFront(null)
 
-  if (alert.runModal !== $.NSAlertFirstButtonReturn) return 'cancelled'
+  if (alert.runModal !== $.NSAlertFirstButtonReturn) {
+    say($.NSFileHandle.fileHandleWithStandardError, 'CANCELLED\n')
+    $.exit(4)
+  }
 
-  fields.forEach((field, i) => {
-    const ok = field.stringValue.writeToFileAtomicallyEncodingError(outDir + '/' + (i + 1), true, $.NSUTF8StringEncoding, null)
-    if (!ok) throw new Error('ADAPTER_ERROR: could not write field ' + (i + 1))
-  })
-  return 'ok'
+  const values = {}
+  specs.forEach((spec, i) => { values[spec.key] = fields[i].stringValue.js })
+  const empty = specs.find((spec) => values[spec.key] === '')
+  if (empty) {
+    say($.NSFileHandle.fileHandleWithStandardError, "CANCELLED: '" + empty.label + "' was left empty\n")
+    $.exit(4)
+  }
+  say($.NSFileHandle.fileHandleWithStandardOutput, JSON.stringify(values))
 }

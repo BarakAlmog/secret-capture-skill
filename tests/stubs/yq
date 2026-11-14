@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Test stub for yq: the test config is JSON (a subset of YAML), so jq reads it the same way.
+exec jq "$@"

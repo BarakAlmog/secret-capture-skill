@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Test stub for `wrangler secret bulk --name <worker>` reading JSON from stdin.
+# Stores the JSON in $SC_TEST_DEST/wrangler/<worker>.json (a fake destination).
+set -euo pipefail
+[[ "${1:-} ${2:-} ${3:-}" == "secret bulk --name" && $# -eq 4 ]] \
+  || { echo "wrangler stub: only 'secret bulk --name <worker>' with stdin: $*" >&2; exit 2; }
+mkdir -p "$SC_TEST_DEST/wrangler"
+cat > "$SC_TEST_DEST/wrangler/$4.json"
+jq -e 'type == "object"' "$SC_TEST_DEST/wrangler/$4.json" >/dev/null

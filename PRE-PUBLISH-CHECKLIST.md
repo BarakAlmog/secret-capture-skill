@@ -15,7 +15,7 @@ Run through this before flipping the repo from **private** to **public** on GitH
 
 ## Code review
 
-- [ ] **`scripts/capture.sh`** — entry point, arg parsing, 2-stage capture, valfile shredding
+- [ ] **`scripts/capture.sh`** — entry point, arg parsing, dialog into the sealed slot, --reuse after a failure
 - [ ] **`scripts/lib/*.sh`** — hygiene / dialog / config / preflight / validate; no D1DX strings
 - [ ] **`scripts/adapters/*.sh`** — one file per target; each passes `lint-adapters.sh`
 - [ ] **`scripts/lint-adapters.sh`** — runs clean against the repo (0 violations)
