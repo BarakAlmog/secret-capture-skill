@@ -22,15 +22,16 @@ The skill does **not** defend against:
 
 | Vector | Mitigation |
 |---|---|
-| **argv exposure** (`ps`, `/proc/<pid>/cmdline`) | Values never appear on argv. `jq --rawfile v /dev/stdin` reads from stdin; `curl -H @file --data @file` reads from files; `expect` drives `security` with the value sent over a pty (never argv). |
+| **argv exposure** (`ps`, `/proc/<pid>/cmdline`) | Values never appear on argv. Adapters pipe the value out of the sealed slot: `jq -Rs` reads stdin; `curl --data-binary @-` reads the body from stdin and `-H @<(...)` the API token from a pipe; `op item create/edit` read the template from stdin; `expect` gets its script with `-c` and the value on stdin, and drives `security` over a pty. |
 | **Environment inheritance** (`/proc/<pid>/environ`) | The value is never `export`ed. Only non-secret metadata (service names, accounts) is passed via env to subprocesses (e.g., `expect`). |
 | **Shell history** | `capture.sh` sets `set +o history`, `HISTFILE=/dev/null`. No invocation ever contains the value as a literal. |
 | **Stdout/stderr leakage to the agent transcript** | Every subcommand that could echo the value is redirected to `/dev/null`. The only stdout the caller ever sees is the reference string (`op://...`, `keychain:...`, etc). |
-| **Tempfiles** | `umask 077` before any `mktemp`. Every tempfile is `trap`-cleaned on exit via `shred -u` (falling back to `rm -f`). |
+| **Disk** | No temp files. The dialog prints the value(s) as one JSON object into `f7 secret seal capture`, which encrypts it to this Mac's Secure Enclave (`~/.f7/sealed/capture.sealed`); adapters read it back with `f7 secret open capture` into a pipe. The slot is deleted after a write that landed and kept after a failure (`--reuse`). `shred` was never a guarantee: it is not installed on macOS, and on an SSD it cannot overwrite in place. `scripts/lint-adapters.sh` fails on `mktemp`, a redirect into a file, `tee`, `curl -o`, `op --template`, an unpiped `--reveal`. Exceptions, marked `# sc-allow-file:`: the `env-file` destination itself and the slot lock's pid. |
 | **Coolify response echo** | Coolify's REST API echoes the env var value in create/read responses. The adapter bypasses the Coolify MCP (whose response would enter the agent transcript) and uses `curl ... -o /dev/null` to discard the response. |
-| **Wrangler stdin bug** | `wrangler secret put` has a broken stdin handler (cloudflare/workers-sdk#1303, open since 2022). The adapter uses `wrangler secret bulk <file>` with a 0600 tempfile, shredded on exit. |
-| **n8n response echo** | The n8n public API redacts password-type fields in responses — safe to parse `.id` without value exposure. |
-| **Dialog cancellation race** | osascript exits non-zero on cancel; adapter never runs because `set -o pipefail` aborts the pipeline. |
+| **Wrangler** | `wrangler secret bulk` with no file reads `{"NAME": "value"}` from stdin (wrangler 4.x); jq builds it in the pipe. |
+| **n8n response echo** | The response goes straight into `jq -r .id`; nothing else of it is kept or printed. |
+| **Dialog cancellation race** | The dialog exits 4 on cancel or an empty box and prints nothing; `slot_seal` seals nothing, and capture.sh reads each stage's exit code before the adapter runs. |
+| **1Password exit codes** | Not trusted. After every write the item is read back and the stored values are compared with the slot by SHA-256 inside the pipes. Rotation edits the item in place by ID: `op item get --reveal` piped through jq into `op item edit`, the template held in process memory only until jq succeeded. |
 
 ## Verifying rotations without peeking
 
@@ -59,7 +60,7 @@ As of commit `9a08853`, the two bugs surfaced during initial smoke testing (CANC
 
 1. **In-process memory**: the value lives briefly in the memory of `osascript`, `expect`, `jq`, `curl`, and the dialog `TextField`. Same-UID processes with access to `/proc/<pid>/mem` can read them during execution. The skill does not use `mlock`.
 2. **Keychain-adapter argv of `security`**: argv is `[-a ACCOUNT -s SERVICE -U -w]` — the `-w` has no value because `expect` drives the interactive prompt. Verify with `ps -ax | grep security` during a write — you should see no value.
-3. **Disk residue**: on the rare adapters that tempfile (`wrangler`, `coolify`, `n8n`, `env-file`), the tempfile lives for milliseconds before `shred`. An adversary with live fs access could snapshot it.
+3. **The sealed slot**: after a failed write the value stays in `~/.f7/sealed/capture.sealed` until a `--reuse` succeeds or the next capture replaces it. It is encrypted to this Mac's Secure Enclave, but any process running as the user on this Mac can open it with no prompt (the f7 trade-off). The `env-file` and `ssh` targets write plain-text files by design.
 4. **osascript limits**: no GUI → skill hard-errors with `NO_GUI` (configurable). osascript auto-dismisses the dialog after 120s (`TIMEOUT`). SSH sessions without `launchctl asuser` cannot show a dialog.
 5. **User-supplied `command:` source spec in config**: `command:<shell-fragment>` is evaluated via `bash -c`. The user controls this line in their own config file; it is not attacker-controlled unless the user's config file is.
 

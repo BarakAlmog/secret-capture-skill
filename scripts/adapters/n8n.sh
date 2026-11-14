@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Adapter: n8n credential (via REST).
-# Uses the n8n public API: POST /api/v1/credentials. Response redacts password-type
-# fields — safe surface. Request body built via jq with --rawfile (never in argv).
+# Uses the n8n public API: POST /api/v1/credentials. Request body built by jq on a pipe
+# (never in argv or a file).
 #
 # Stdout: n8n-cred:<name> (id=<id>)
 #
@@ -12,6 +12,8 @@ set -euo pipefail
 
 # shellcheck source=../lib/config.sh
 source "${SKILL_ROOT:?SKILL_ROOT not set}/scripts/lib/config.sh"
+# shellcheck source=../lib/slot.sh
+source "$SKILL_ROOT/scripts/lib/slot.sh"
 
 INSTANCE=""
 CRED_NAME=""
@@ -43,44 +45,25 @@ URL=$(config_get "defaults.n8n.instances.${INSTANCE}.url")
 API_KEY_SOURCE=$(config_get "defaults.n8n.instances.${INSTANCE}.api_key_source")
 [[ -n "$API_KEY_SOURCE" ]] || { echo "CONFIG_ERROR: defaults.n8n.instances.${INSTANCE}.api_key_source not set" >&2; exit 9; }
 
-umask 077
-body=$(mktemp -t sc-n8n-body-XXXXXX)
-auth=$(mktemp -t sc-n8n-auth-XXXXXX)
-out=$(mktemp -t sc-n8n-out-XXXXXX)
-cleanup() {
-  shred -u "$body" "$auth" "$out" 2>/dev/null || true
-  rm -f "$body" "$auth" "$out"
-}
-trap cleanup EXIT
-
-{ printf 'X-N8N-API-KEY: '; resolve_source "$API_KEY_SOURCE"; printf '\n'; } > "$auth"
-
-jq -n \
-  --arg name "$CRED_NAME" \
-  --arg type "$CRED_TYPE" \
-  --arg field "$DATA_FIELD" \
-  --argjson extra "$FIELDS_JSON" \
-  --rawfile v /dev/stdin \
-  '{
-    name: $name,
-    type: $type,
-    data: ($extra + { ($field): ($v | rtrimstr("\n")) })
-  }' > "$body"
-
-http_code=$(curl -sS -X POST \
-  "${URL%/}/api/v1/credentials" \
-  -H @"$auth" \
-  -H 'content-type: application/json' \
-  --data @"$body" \
-  -o "$out" -w "%{http_code}")
-
-if [[ "$http_code" -lt 200 || "$http_code" -ge 300 ]]; then
-  echo "ADAPTER_ERROR: n8n HTTP $http_code" >&2
-  exit 7
-fi
-
-# n8n response redacts password-type fields — safe to parse .id out of the response.
-cred_id=$(jq -r '.id // empty' "$out" 2>/dev/null || true)
+# The request body is built by jq from the value piped out of the sealed slot and handed to
+# curl on stdin; the API key reaches curl through a pipe (-H @<(...)). The response goes
+# straight into jq, which keeps only the credential's id. --fail turns a non-2xx status into
+# a non-zero exit.
+cred_id=$(
+  slot_value value \
+    | jq -c -Rs \
+        --arg name "$CRED_NAME" \
+        --arg type "$CRED_TYPE" \
+        --arg field "$DATA_FIELD" \
+        --argjson extra "$FIELDS_JSON" \
+        '{ name: $name, type: $type, data: ($extra + { ($field): . }) }' \
+    | curl -sS --fail -X POST \
+        "${URL%/}/api/v1/credentials" \
+        -H @<(printf 'X-N8N-API-KEY: '; resolve_source "$API_KEY_SOURCE"; printf '\n') \
+        -H 'content-type: application/json' \
+        --data-binary @- \
+    | jq -r '.id // empty'
+) || { echo "ADAPTER_ERROR: n8n write failed (above)" >&2; exit 7; }
 
 if [[ -z "$cred_id" ]]; then
   echo "ADAPTER_ERROR: n8n response missing credential id" >&2

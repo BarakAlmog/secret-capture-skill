@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Adapter: GitHub Actions secret (repo / org / env).
-# `gh secret set NAME` reads the value from stdin when --body is absent.
+# `gh secret set NAME` reads the value from stdin when --body is absent: the value is piped
+# out of the sealed slot (lib/slot.sh) straight into it.
 # Stdout: gh-secret:<scope-path>#<name>
 
 set -euo pipefail
+
+# shellcheck source=../lib/slot.sh
+source "${SKILL_ROOT:?SKILL_ROOT not set}/scripts/lib/slot.sh"
 
 SCOPE="repo"
 NAME=""
@@ -29,20 +33,20 @@ done
 case "$SCOPE" in
   repo)
     [[ -z "$REPO" ]] && { echo "USAGE_ERROR: --repo required for scope=repo" >&2; exit 2; }
-    gh secret set "$NAME" --repo "$REPO" >/dev/null 2>&1 \
-      || { echo "ADAPTER_ERROR: gh secret set failed" >&2; exit 7; }
+    slot_value value | gh secret set "$NAME" --repo "$REPO" >/dev/null \
+      || { echo "ADAPTER_ERROR: gh secret set failed (above)" >&2; exit 7; }
     printf 'gh-secret:%s#%s\n' "$REPO" "$NAME"
     ;;
   org)
     [[ -z "$ORG" ]] && { echo "USAGE_ERROR: --org required for scope=org" >&2; exit 2; }
-    gh secret set "$NAME" --org "$ORG" --visibility "$VISIBILITY" >/dev/null 2>&1 \
-      || { echo "ADAPTER_ERROR: gh secret set failed" >&2; exit 7; }
+    slot_value value | gh secret set "$NAME" --org "$ORG" --visibility "$VISIBILITY" >/dev/null \
+      || { echo "ADAPTER_ERROR: gh secret set failed (above)" >&2; exit 7; }
     printf 'gh-secret:org/%s#%s\n' "$ORG" "$NAME"
     ;;
   env)
     [[ -z "$REPO" || -z "$ENV_NAME" ]] && { echo "USAGE_ERROR: --repo and --env required for scope=env" >&2; exit 2; }
-    gh secret set "$NAME" --repo "$REPO" --env "$ENV_NAME" >/dev/null 2>&1 \
-      || { echo "ADAPTER_ERROR: gh secret set failed" >&2; exit 7; }
+    slot_value value | gh secret set "$NAME" --repo "$REPO" --env "$ENV_NAME" >/dev/null \
+      || { echo "ADAPTER_ERROR: gh secret set failed (above)" >&2; exit 7; }
     printf 'gh-secret:%s/env/%s#%s\n' "$REPO" "$ENV_NAME" "$NAME"
     ;;
   *)

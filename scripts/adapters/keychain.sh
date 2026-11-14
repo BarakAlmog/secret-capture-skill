@@ -18,6 +18,9 @@
 
 set -euo pipefail
 
+# shellcheck source=../lib/slot.sh
+source "${SKILL_ROOT:?SKILL_ROOT not set}/scripts/lib/slot.sh"
+
 SERVICE=""
 ACCOUNT=""
 SILENT_READ=""
@@ -43,14 +46,16 @@ if security find-generic-password -s "$SERVICE" -a "$ACCOUNT" >/dev/null 2>&1; t
   fi
 fi
 
-# SC_ACCOUNT and SC_SERVICE reach the expect process via env — they are NOT secrets.
-# The value itself is read from expect's stdin and only lives in expect's Tcl memory.
-if ! SC_ACCOUNT="$ACCOUNT" SC_SERVICE="$SERVICE" expect <<'TCL' >/dev/null 2>&1
+# The expect script is passed with -c (it holds no secret), so expect's stdin is free for the
+# value, piped out of the sealed slot (lib/slot.sh). SC_ACCOUNT and SC_SERVICE reach the
+# expect process via env — they are NOT secrets. The value only lives in expect's Tcl memory
+# and goes to `security` over a pty, never on its argv.
+TCL='
 log_user 0
 set acc $env(SC_ACCOUNT)
 set svc $env(SC_SERVICE)
 set val [read stdin]
-regsub {\n$} $val {} val
+if {$val eq ""} { exit 7 }
 spawn -noecho /usr/bin/security add-generic-password -a $acc -s $svc -U -w
 expect {
   -re {password (data )?for (new|existing) item:} {}
@@ -63,8 +68,8 @@ expect {
   timeout { exit 7 }
 }
 set val ""
-TCL
-then
+'
+if ! slot_value value | SC_ACCOUNT="$ACCOUNT" SC_SERVICE="$SERVICE" expect -c "$TCL" >/dev/null; then
   echo "ADAPTER_ERROR: expect-driven 'security add-generic-password' failed" >&2
   exit 7
 fi

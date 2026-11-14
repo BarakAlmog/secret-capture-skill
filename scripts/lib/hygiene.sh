@@ -9,7 +9,7 @@ set +o history 2>/dev/null || true
 HISTFILE=/dev/null
 export HISTFILE
 
-# Restrictive umask for any tempfile we create.
+# Restrictive umask for any file this process creates (the slot lock, an env-file destination).
 umask 077
 
 # Guard against inherited $IFS weirdness.

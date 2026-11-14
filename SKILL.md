@@ -32,10 +32,21 @@ Never store the same secret in two places.
 The skill is a bash script. Invoke via the Bash tool:
 
 ```bash
-bash ~/.claude/skills/secret-capture-skill/scripts/capture.sh --target <target> [target-flags] [--rotate] [--expect <shape>]
+bash ~/.claude/skills/secret-capture-skill/scripts/capture.sh --target <target> [target-flags] [--rotate] [--expect <shape>] [--reuse]
 ```
 
-You pass only the destination metadata. You never pass, read, or handle the value. The script opens a hidden-input dialog, captures the value, pipes it directly to the destination, and returns a reference on stdout.
+You pass only the destination metadata. You never pass, read, or handle the value. The script opens a hidden-input dialog, seals what it returns into the sealed slot, pipes it from there into the destination, and returns a reference on stdout.
+
+Requires `f7` (`f7 secret seal|open`) and `jq` on PATH.
+
+## The sealed slot, and a retry without a second paste
+
+The dialog's output is piped straight into `f7 secret seal capture`: encrypted to this Mac's Secure Enclave, at `~/.f7/sealed/capture.sealed`. Adapters pipe it back out with `f7 secret open capture` into the destination's stdin. There is one slot, overwritten by every capture, so nothing piles up.
+
+- **Write landed** → the slot is deleted.
+- **Write failed** (any adapter error after the paste) → the slot is kept, and stderr says `HELD: ... rerun the same command with --reuse`. Fix the cause, then rerun with `--reuse`: the held value is written and **no dialog opens**. You may change other flags on the rerun (add `--rotate`, fix a vault name); the held value must have the same fields (one value, or the same `--field` names), or `--reuse` refuses with `USAGE_ERROR` and keeps it.
+- Without `--reuse`, a held value is replaced by the new paste.
+- A lock (`~/.f7/sealed/capture.lock`) keeps two captures off the slot at once: the second exits `BUSY` (10). A lock whose process is gone is taken over.
 
 ## Targets
 
@@ -47,7 +58,9 @@ bash capture.sh --target 1password \
   [--category API_CREDENTIAL] [--rotate]
 ```
 
-`--category` accepts the canonical UPPERCASE_UNDERSCORE template id (`API_CREDENTIAL`, `LOGIN`, `PASSWORD`, `DATABASE`, `SECURE_NOTE`, `SERVER`) or a human-readable equivalent (`"API Credential"`, `"api-credential"`) — the adapter normalizes to the canonical form before passing to `op item create`. Default: `API_CREDENTIAL`.
+`--category` accepts the canonical UPPERCASE_UNDERSCORE template id (`API_CREDENTIAL`, `LOGIN`, `PASSWORD`, `DATABASE`, `SECURE_NOTE`, `SERVER`) or a human-readable equivalent (`"API Credential"`, `"api-credential"`) — the adapter normalizes to the canonical form before passing to `op item create`. Default: `API_CREDENTIAL`. Refused before the dialog: any other category, `PASSWORD` without `--field password` (its built-in field), `LOGIN` without `--field username:visible --field password`.
+
+`--rotate` edits the item **in place**: same ID, every other field, the notes, tags and URLs kept. The adapter never trusts `op`'s exit code: after every write it reads the item back and compares the stored values with the slot by SHA-256 (nothing printed). A write `op` reported as failed but that landed (this service account has returned a 404 on an edit that applied) succeeds with a `WARNING`; a write that did not land fails with the value held. Before the dialog it checks the vault is reachable, the item exists (rotate) or does not (create), the title names one active item, and every `--field` is on it (rotate).
 
 Returns: `op://<vault>/<item>/<field>`
 
@@ -137,7 +150,7 @@ bash capture.sh --target env-file --file <path> --key <KEY_NAME>
 
 Returns: `env-file:<path>#<key>`
 
-Writes to a local `.env` file with mode 0600. Creates the file if missing.
+Writes to a local `.env` file with mode 0600. Creates the file if missing. The file is plain text by nature: the new version is written beside it as `<file>.sc-new` (0600) and renamed over it; no other copy is made.
 
 ### `ssh`
 
@@ -163,13 +176,13 @@ Use when you need to inject a secret into a remote server without reading it you
 
 **Atomicity:** value is piped over ssh stdin, written to `<remote-path>.sc-new` with `umask 077`, chmod'd, then `mv`'d into place. No partial-write window.
 
-**Security:** value never touches argv, env, or any shell variable. End-to-end pipe: local stdin → local temp (0600, shredded) → ssh stdin → remote `cat > .sc-new` → remote `mv`. Single quotes in the value (`file-kv` mode) are escaped via sed on the local side.
+**Security:** value never touches a local file, argv, env, or any shell variable. End-to-end pipe: sealed slot → `jq` (`file-kv`: builds `KEY='value'`, each `'` written `'\''`) → ssh stdin → remote `cat` into `<path>.sc-new` (umask 077) → remote `mv`. `file-kv` keeps the old file's other lines on the remote side: they never come to this Mac.
 
 **Idempotency:** checks the remote file before writing. `file-kv` checks for the `KEY=` prefix; `file-raw` checks for file existence. Duplicate → `DUPLICATE` (exit 6) unless `--rotate` is passed.
 
 ## Rotation
 
-Add `--rotate` to any invocation. The adapter switches from create → edit/update/overwrite. If the record doesn't exist, it fails with `NOT_FOUND`.
+Add `--rotate` to any invocation. The adapter switches from create → edit/update/overwrite. If the record doesn't exist, it fails with `NOT_FOUND` (exit 7; for 1Password, before the dialog).
 
 ## Format validation
 
@@ -203,7 +216,10 @@ ref=$(bash capture.sh --target keychain --service anthropic-cli --account $(whoa
 - `AUTH_FAIL` — destination auth failed; fix credentials and retry
 - `DUPLICATE` — item exists; re-invoke with `--rotate` or pick a different name
 - `FORMAT_MISMATCH` — `--expect` names an unknown pattern (checked before the dialog)
-- `ADAPTER_ERROR` — subcommand failed; check adapter preflight
+- `ADAPTER_ERROR` — subcommand failed, or a write could not be verified ("not verified"); check adapter preflight
+- `NOT_FOUND` — `--rotate` target (item or field) does not exist
+- `BUSY` — another capture holds the sealed slot (exit 10)
+- `HELD` — not an error of its own: after any failure past the dialog, the value is held; rerun with `--reuse`
 
 None of these ever contain the value.
 
@@ -213,7 +229,8 @@ None of these ever contain the value.
 - Value never in env (readable via `/proc/<pid>/environ`)
 - Value never in shell history
 - Value never in any stdout the agent sees
-- Tempfiles are 0600 and shredded on exit
+- Value never in a plain-text file: dialog → `f7 secret seal` → `f7 secret open` → destination, through pipes only. The one file is the slot, sealed to the Secure Enclave; it is deleted after a write that landed. (`env-file` and `ssh` targets are files by definition: see above.) A 1Password item revealed for an in-place rotation moves through pipes and this process's memory, never a file.
+- `scripts/lint-adapters.sh` enforces it: it fails on `mktemp`, a redirect into a file, `tee`, `curl -o <file>`, `op --template`/`--out-file`, a `--reveal` that is not piped on, and a dialog script that writes a file. `tests/run.sh` runs every adapter but keychain end to end with stubs and fails if a value reaches stdout, stderr, TMPDIR or any file outside the destination.
 
 ## Do NOT
 

@@ -14,3 +14,4 @@ credentials.json
 *.key
 GEMINI.md
 .gemini/settings.json
+tmp/

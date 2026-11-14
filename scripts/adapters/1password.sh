@@ -1,35 +1,44 @@
 #!/usr/bin/env bash
 # Adapter: 1Password item.
-# Reads value from stdin. Creates a new item, or (with --rotate) preserves every
-# other field on the existing item and replaces only the target field's value.
-# Stdout: op://<vault>/<item>/<field>
+# Reads the value(s) from the sealed slot (lib/slot.sh), never from a file. Creates a new
+# item, or (with --rotate) edits the existing item in place: same ID, every other field kept.
+# Stdout: op://<vault>/<item>/<field>, one line per field.
 #
-# Why delete+recreate on rotation: `op item edit` only accepts value assignments on argv,
-# which would leak the value through `ps`. `op item create --template <path>` reads the JSON
-# from a 0600 tempfile built by jq with `--rawfile v /dev/stdin`, so the value never touches
-# argv or a shell variable.
+# Create: the slot's JSON -> jq builds the item template -> `op item create --vault V -`.
+# Rotate: `op item get <id> --reveal` -> jq swaps the target fields' values for the slot's ->
+#   `op item edit <id>`. A template edit replaces the item's whole field list (checked live,
+#   op 2.39), so the template carries the full item, other fields' values included.
+# Either template is built in this process's memory first and handed to op on stdin only
+# when jq succeeded: op never reads a half-built or empty template. It is never in a file,
+# on argv or in the environment.
 #
-# Field preservation on rotate: we first `op item get --reveal` to read the full current
-# item (values included — briefly transits jq's memory, never argv/env/stdout), use jq to
-# swap just the target field's value, then recreate with the full template. Non-target fields
-# (notes, username, dates, etc.) round-trip untouched.
+# Verify by result: 1Password's exit code is not trusted (this service account has reported
+# a 404 on an edit that applied). After every write the item is read back and the stored
+# values are compared with the slot's by SHA-256 inside the pipes; nothing is printed.
 #
-# The old item goes to the archive under a dated title: an archived item that keeps the name
-# makes `op run`, `op read` and `op item get` fail with "more than one item". It is renamed
-# before the new one exists and archived after, so a failed create can put it back unharmed.
+# Items are found by exact title with `op item list` (no values in its output, archived
+# items left out) and then addressed by ID.
 #
-# Why CATEGORY default is "API_CREDENTIAL" (not "API Credential"): op CLI requires the
-# uppercase-underscore template ID. Get the canonical list via `op item template list`.
+# Several fields (SC_MULTI=1, one --field per value): the slot holds {"<field>": value}.
+# One field: the slot holds {"value": value}. On LOGIN, "username" and "password" carry
+# 1Password's login purposes; on PASSWORD, "password" is the built-in password field. A
+# ":visible" field is plain text, every other field is concealed.
+#
+# SC_CHECK=1: capture.sh runs this before the dialog, with no value. Everything that can
+# fail without the value fails there: an unsupported category, an unreachable vault, a
+# duplicate, a missing rotate target or field.
 
 set -euo pipefail
+{ set +x; } 2>/dev/null
+
+# shellcheck source=../lib/slot.sh
+source "${SKILL_ROOT:?SKILL_ROOT not set}/scripts/lib/slot.sh"
 
 # Normalize a --category value to the UPPERCASE_UNDERSCORE template id form that
 # op item create --category requires. Accepts "API Credential", "api-credential",
 # "API_CREDENTIAL", "Login", etc. and produces "API_CREDENTIAL", "LOGIN", etc.
 normalize_category() {
-  local raw="$1"
-  # Trim leading/trailing whitespace, uppercase, replace spaces+hyphens with underscore
-  printf '%s' "$raw" | tr '[:lower:]' '[:upper:]' | tr ' -' '_' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+  printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '[:lower:]' '[:upper:]' | tr ' -' '_'
 }
 
 VAULT=""
@@ -52,152 +61,140 @@ done
 [[ -z "$VAULT" ]] && { echo "USAGE_ERROR: --vault required" >&2; exit 2; }
 [[ -z "$ITEM" ]]  && { echo "USAGE_ERROR: --item required" >&2; exit 2; }
 [[ -z "$TITLE" ]] && TITLE="$ITEM"
-FIELD="${FIELDS[0]:-credential}"
-FIELD="${FIELD%%:*}"
-
+(( ${#FIELDS[@]} > 0 )) || FIELDS=(credential)
 ROTATE="${ROTATE:-}"
+SC_MULTI="${SC_MULTI:-}"
 
-# SC_CHECK=1: capture.sh runs this before the dialog opens, with no value.
-# Everything that can fail without the value fails here, before the user pastes.
-if [[ -n "${SC_CHECK:-}" ]]; then
-  op vault get "$VAULT" --format=json >/dev/null \
-    || { echo "ADAPTER_ERROR: vault '$VAULT' is not reachable with this 1Password session" >&2; exit 7; }
-  if op item get "$ITEM" --vault "$VAULT" --format=json >/dev/null 2>&1; then
-    [[ -n "$ROTATE" ]] && exit 0
-    echo "DUPLICATE: item '$ITEM' exists in vault '$VAULT'; pass --rotate to overwrite" >&2
-    exit 6
-  fi
-  [[ -z "$ROTATE" ]] && exit 0
-  echo "NOT_FOUND: item '$ITEM' is not in vault '$VAULT'; nothing to rotate" >&2
-  exit 7
-fi
+# One entry per field: its name, its key in the slot, and the type and purpose a new item
+# gives it. Names and kinds only, never a value.
+SPECS=$(
+  for spec in "${FIELDS[@]}"; do
+    name="${spec%%:*}"
+    key=value; [[ -n "$SC_MULTI" ]] && key="$name"
+    type=CONCEALED; purpose=""
+    [[ "$spec" == *:visible ]] && type=STRING
+    if [[ "$CATEGORY" == LOGIN && "$name" == username ]]; then type=STRING; purpose=USERNAME; fi
+    if [[ "$CATEGORY" == LOGIN && "$name" == password ]]; then type=CONCEALED; purpose=PASSWORD; fi
+    if [[ "$CATEGORY" == PASSWORD && "$name" == password ]]; then type=CONCEALED; purpose=PASSWORD; fi
+    jq -nc --arg n "$name" --arg k "$key" --arg t "$type" --arg p "$purpose" '{name: $n, key: $k, type: $t, purpose: $p}'
+  done | jq -cs .
+)
 
-umask 077
-payload=$(mktemp -t sc-1p-XXXXXX)
-fullitem=$(mktemp -t sc-1p-full-XXXXXX)
-nextpayload=$(mktemp -t sc-1p-next-XXXXXX)
-cleanup() { shred -u "$payload" "$fullitem" "$nextpayload" 2>/dev/null || rm -f "$payload" "$fullitem" "$nextpayload"; }
-trap cleanup EXIT
-
-# Several fields (capture.sh passed SC_VALUES_DIR): value n of --field n is the file
-# $SC_VALUES_DIR/n. One item holds them all. On a LOGIN item "username" and "password"
-# carry 1Password's login purposes so autofill finds them; a ":visible" field is plain
-# text, every other field is concealed.
-#
-# Rotating: "$fullitem" holds the old item, and create_item replaces it.
-rotating=""
-create_item() {
-  local old_id=""
-  if [[ -n "$rotating" ]]; then
-    old_id=$(jq -r .id "$fullitem")
-    op item edit "$old_id" --vault "$VAULT" --title "$ITEM-rotated-$(date +%Y%m%d-%H%M%S)" </dev/null >/dev/null \
-      || { echo "ADAPTER_ERROR: failed to retire the old item for rotation" >&2; exit 7; }
-  fi
-  if ! op item create --vault "$VAULT" --template "$payload" </dev/null >/dev/null; then
-    if [[ -n "$old_id" ]]; then
-      op item edit "$old_id" --vault "$VAULT" --title "$ITEM" </dev/null >/dev/null \
-        || echo "ADAPTER_ERROR: the old item keeps its dated title; rename it back to '$ITEM'" >&2
-    fi
-    echo "ADAPTER_ERROR: op item create failed" >&2
-    exit 7
-  fi
-  if [[ -n "$old_id" ]]; then
-    op item delete "$old_id" --vault "$VAULT" --archive </dev/null >/dev/null \
-      || echo "WARNING: the old item is still active under its dated title; archive it" >&2
-  fi
+has_field() {
+  local want="$1" spec
+  for spec in "${FIELDS[@]}"; do [[ "${spec%%:*}" == "$want" ]] && return 0; done
+  return 1
 }
 
-if [[ -n "${SC_VALUES_DIR:-}" ]]; then
-  if op item get "$ITEM" --vault "$VAULT" --format=json >/dev/null 2>&1; then
-    [[ -n "$ROTATE" ]] \
-      || { echo "DUPLICATE: item '$ITEM' exists in vault '$VAULT'; pass --rotate to overwrite" >&2; exit 6; }
-    op item get "$ITEM" --vault "$VAULT" --format=json --reveal > "$fullitem" \
-      || { echo "ADAPTER_ERROR: op item get --reveal failed" >&2; exit 7; }
-    jq '{title: .title, category: .category, fields: (.fields // []), sections: (.sections // []), tags: (.tags // []), urls: (.urls // [])}' \
-      "$fullitem" > "$payload"
-    i=0
-    for spec in "${FIELDS[@]}"; do
-      i=$((i + 1))
-      jq -e --arg f "${spec%%:*}" '.fields | any(.label == $f or .id == $f)' "$payload" >/dev/null \
-        || { echo "ADAPTER_ERROR: field '${spec%%:*}' not found on existing item; aborting to preserve original" >&2; exit 7; }
-      jq --arg f "${spec%%:*}" --rawfile v "$SC_VALUES_DIR/$i" \
-        '.fields |= map(if (.label == $f or .id == $f) then .value = ($v | rtrimstr("\n")) else . end)' \
-        "$payload" > "$nextpayload"
-      cp "$nextpayload" "$payload"
-    done
-    rotating=1
-  else
-    jq -n --arg title "$TITLE" --arg cat "$CATEGORY" '{title: $title, category: $cat, fields: []}' > "$payload"
-    i=0
-    for spec in "${FIELDS[@]}"; do
-      i=$((i + 1))
-      name="${spec%%:*}"
-      type=CONCEALED; purpose=""
-      [[ "$spec" == *:visible ]] && type=STRING
-      if [[ "$CATEGORY" == LOGIN && "$name" == username ]]; then type=STRING; purpose=USERNAME; fi
-      if [[ "$CATEGORY" == LOGIN && "$name" == password ]]; then type=CONCEALED; purpose=PASSWORD; fi
-      jq --arg f "$name" --arg t "$type" --arg p "$purpose" --rawfile v "$SC_VALUES_DIR/$i" \
-        '.fields += [{id: $f, label: $f, type: $t, value: ($v | rtrimstr("\n"))} + (if $p == "" then {} else {purpose: $p} end)]' \
-        "$payload" > "$nextpayload"
-      cp "$nextpayload" "$payload"
-    done
+# A category whose required built-in fields this adapter does not write fails in 1Password
+# after the paste ("Password item requires ps value", 2026-11-14). Refuse it before.
+check_category() {
+  case "$CATEGORY" in
+    API_CREDENTIAL|SECURE_NOTE|DATABASE|SERVER) ;;
+    LOGIN)
+      has_field username && has_field password \
+        || { echo "USAGE_ERROR: a LOGIN item needs --field username:visible and --field password" >&2; return 2; }
+      ;;
+    PASSWORD)
+      has_field password \
+        || { echo "USAGE_ERROR: a PASSWORD item needs its built-in field: pass --field password, or use --category API_CREDENTIAL" >&2; return 2; }
+      ;;
+    *)
+      echo "USAGE_ERROR: category '$CATEGORY' is not supported; use API_CREDENTIAL, LOGIN, PASSWORD, DATABASE, SECURE_NOTE or SERVER" >&2
+      return 2
+      ;;
+  esac
+}
+
+# find_item_id — the ID of the active item titled exactly $ITEM, or nothing when there is none.
+# Fails when the vault cannot be listed, or when several items share the title.
+find_item_id() {
+  local listing ids=()
+  listing=$(op item list --vault "$VAULT" --format json | jq -r --arg t "$ITEM" '[.[] | select(.title == $t) | .id] | join(" ")') \
+    || { echo "ADAPTER_ERROR: could not list vault '$VAULT' (above)" >&2; return 7; }
+  read -r -a ids <<<"$listing"
+  case "${#ids[@]}" in
+    0) ;;
+    1) printf '%s\n' "${ids[0]}" ;;
+    *) echo "ADAPTER_ERROR: ${#ids[@]} items in vault '$VAULT' are titled '$ITEM' (${ids[*]}); keep one" >&2; return 7 ;;
+  esac
+}
+
+# The jq definition every template uses: the slot's value under a key, or an error.
+HELD_DEF='def held($v; $k): $v[$k] | if type == "string" and length > 0 then . else error("the sealed slot holds no value under \"\($k)\"") end;'
+
+# verify <id> — 0 when the item's target fields hold exactly the slot's values, 1 when they
+# do not, 2 when that could not be checked ("not verified"). Compares SHA-256 digests.
+verify() {
+  local want got
+  want=$(slot_open | jq -cS --argjson specs "$SPECS" '. as $v | [$specs[] | {(.name): $v[.key]}] | add' | shasum -a 256) \
+    || return 2
+  got=$(op item get "$1" --vault "$VAULT" --format json --reveal | jq -cS --argjson specs "$SPECS" '.fields as $f | [$specs[] | .name as $n | {($n): ([$f[] | select(.id == $n or .label == $n) | .value] | first)}] | add' | shasum -a 256) \
+    || return 2
+  [[ "$want" == "$got" ]]
+}
+
+# settle <id> <op-failed> — report a write by what the item holds, not by op's exit code.
+settle() {
+  local v=0
+  verify "$1" || v=$?
+  case "$v" in
+    0) [[ -z "$2" ]] || echo "WARNING: 1Password reported a failure (above), but item $1 holds the new value (verified)" >&2 ;;
+    1) echo "ADAPTER_ERROR: item $1 does not hold the captured value after the write" >&2; exit 7 ;;
+    *) echo "ADAPTER_ERROR: not verified: item $1 could not be read back (above)" >&2; exit 7 ;;
+  esac
+}
+
+if [[ -n "${SC_CHECK:-}" ]]; then
+  [[ -n "$ROTATE" ]] || check_category || exit $?
+  id=$(find_item_id) || exit $?
+  if [[ -z "$ROTATE" ]]; then
+    [[ -z "$id" ]] || { echo "DUPLICATE: item '$ITEM' exists in vault '$VAULT'; pass --rotate to overwrite" >&2; exit 6; }
+    exit 0
   fi
-  create_item
-  for spec in "${FIELDS[@]}"; do printf 'op://%s/%s/%s\n' "$VAULT" "$ITEM" "${spec%%:*}"; done
+  [[ -n "$id" ]] || { echo "NOT_FOUND: item '$ITEM' is not in vault '$VAULT'; nothing to rotate" >&2; exit 7; }
+  set +e
+  op item get "$id" --vault "$VAULT" --format json \
+    | jq -e --argjson specs "$SPECS" '([$specs[].name] - [.fields[] | .id, .label]) as $m | if ($m | length) > 0 then ("NOT_FOUND: field(s) not on item '" + .title + "': " + ($m | join(", ")) + "\n" | halt_error(7)) else true end' >/dev/null
+  st=("${PIPESTATUS[@]}")
+  set -e
+  (( st[0] == 0 )) || { echo "ADAPTER_ERROR: could not read item '$ITEM' (above)" >&2; exit 7; }
+  (( st[1] == 0 )) || exit 7
   exit 0
 fi
 
-if op item get "$ITEM" --vault "$VAULT" --format=json >/dev/null 2>&1; then
-  if [[ -z "$ROTATE" ]]; then
-    echo "DUPLICATE: item '$ITEM' exists in vault '$VAULT'; pass --rotate to overwrite" >&2
-    exit 6
+id=$(find_item_id) || exit $?
+op_failed=""
+
+if [[ -z "$ROTATE" ]]; then
+  check_category || exit $?
+  [[ -z "$id" ]] || { echo "DUPLICATE: item '$ITEM' exists in vault '$VAULT'; pass --rotate to overwrite" >&2; exit 6; }
+  template=$(slot_open | jq -c --arg title "$TITLE" --arg cat "$CATEGORY" --argjson specs "$SPECS" "$HELD_DEF"'
+    . as $v
+    | {title: $title, category: $cat,
+       fields: [$specs[] | {id: .name, label: .name, type: .type, value: held($v; .key)} + (if .purpose == "" then {} else {purpose: .purpose} end)]}') \
+    || { echo "ADAPTER_ERROR: could not build the item from the sealed slot (above)" >&2; exit 7; }
+  id=$(printf '%s' "$template" | op item create --vault "$VAULT" --format json - | jq -r '.id') || op_failed=1
+  template=""
+  if [[ -n "$op_failed" || -z "$id" ]]; then
+    op_failed=1
+    id=$(find_item_id) || { echo "ADAPTER_ERROR: not verified: op item create failed and the vault could not be listed" >&2; exit 7; }
+    [[ -n "$id" ]] || { echo "ADAPTER_ERROR: op item create failed (above); no item '$ITEM' was made" >&2; exit 7; }
   fi
-
-  # Rotate path: read full item (with values) and swap only the target field's value.
-  op item get "$ITEM" --vault "$VAULT" --format=json --reveal > "$fullitem" 2>/dev/null \
-    || { echo "ADAPTER_ERROR: op item get --reveal failed" >&2; exit 7; }
-
-  # Read the existing item from "$fullitem" (positional arg) AND the new value
-  # from /dev/stdin via --rawfile — two separate inputs, no stdin conflict.
-  jq --arg field "$FIELD" --rawfile v /dev/stdin '
-    {
-      title: .title,
-      category: .category,
-      fields: ((.fields // []) | map(
-        if (.label == $field or .id == $field)
-        then .value = ($v | rtrimstr("\n"))
-        else .
-        end
-      )),
-      sections: (.sections // []),
-      tags: (.tags // []),
-      urls: (.urls // [])
-    }
-  ' "$fullitem" > "$payload"
-
-  # Sanity check: did jq actually find the target field?
-  if ! jq -e --arg f "$FIELD" '.fields | any(.label == $f or .id == $f)' "$payload" >/dev/null 2>&1; then
-    echo "ADAPTER_ERROR: field '$FIELD' not found on existing item; aborting to preserve original" >&2
-    exit 7
-  fi
-
-  rotating=1
 else
-  # Create path: new item with just the target field.
-  jq -n \
-    --arg title "$TITLE" \
-    --arg cat "$CATEGORY" \
-    --arg field "$FIELD" \
-    --rawfile v /dev/stdin \
-    '{
-       title: $title,
-       category: $cat,
-       fields: [
-         { id: $field, label: $field, type: "CONCEALED", value: ($v | rtrimstr("\n")) }
-       ]
-     }' > "$payload"
+  [[ -n "$id" ]] || { echo "NOT_FOUND: item '$ITEM' is not in vault '$VAULT'; nothing to rotate" >&2; exit 7; }
+  template=$(op item get "$id" --vault "$VAULT" --format json --reveal | jq -c --argjson specs "$SPECS" --slurpfile slot <(slot_open) "$HELD_DEF"'
+    ($slot[0] // {}) as $v
+    | ([$specs[].name] - [.fields[] | .id, .label]) as $missing
+    | if ($missing | length) > 0 then error("field(s) not on the item: \($missing | join(", "))") else . end
+    | .fields |= map(. as $f
+        | ([$specs[] | select(.name == $f.id or .name == $f.label)] | first) as $s
+        | if $s then .value = held($v; $s.key) else . end)') \
+    || { echo "ADAPTER_ERROR: could not build the rotated item (above); nothing was written" >&2; exit 7; }
+  printf '%s' "$template" | op item edit "$id" --vault "$VAULT" --format json >/dev/null || op_failed=1
+  template=""
 fi
 
-create_item
+settle "$id" "$op_failed"
 
-printf 'op://%s/%s/%s\n' "$VAULT" "$ITEM" "$FIELD"
+for spec in "${FIELDS[@]}"; do printf 'op://%s/%s/%s\n' "$VAULT" "$ITEM" "${spec%%:*}"; done

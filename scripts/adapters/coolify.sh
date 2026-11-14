@@ -16,6 +16,8 @@ set -euo pipefail
 
 # shellcheck source=../lib/config.sh
 source "${SKILL_ROOT:?SKILL_ROOT not set}/scripts/lib/config.sh"
+# shellcheck source=../lib/slot.sh
+source "$SKILL_ROOT/scripts/lib/slot.sh"
 
 INSTANCE=""
 APP_UUID=""
@@ -49,37 +51,23 @@ COOLIFY_URL=$(config_get "defaults.coolify.instances.${INSTANCE}.url")
 API_KEY_SOURCE=$(config_get "defaults.coolify.instances.${INSTANCE}.api_key_source")
 [[ -n "$API_KEY_SOURCE" ]] || { echo "CONFIG_ERROR: defaults.coolify.instances.${INSTANCE}.api_key_source not set" >&2; exit 9; }
 
-umask 077
-body=$(mktemp -t sc-coolify-body-XXXXXX)
-auth=$(mktemp -t sc-coolify-auth-XXXXXX)
-cleanup() {
-  shred -u "$body" "$auth" 2>/dev/null || true
-  rm -f "$body" "$auth"
-}
-trap cleanup EXIT
-
-# Build auth header file without ever holding the token in a shell variable.
-{ printf 'authorization: Bearer '; resolve_source "$API_KEY_SOURCE"; printf '\n'; } > "$auth"
-
-# Build the POST body: key, value (from stdin), scoping flags.
-jq -n \
-  --arg k "$KEY" \
-  --rawfile v /dev/stdin \
-  --argjson pre "$IS_PREVIEW" \
-  '{ key: $k, value: ($v | rtrimstr("\n")), is_preview: $pre }' > "$body"
-
 METHOD="POST"
 if [[ -n "$ROTATE" ]]; then
   METHOD="PATCH"
 fi
 
-# Response discarded entirely — Coolify echoes the value back in both create and get.
-curl -sS -X "$METHOD" \
-  "${COOLIFY_URL%/}/api/v1/applications/${APP_UUID}/envs" \
-  -H @"$auth" \
-  -H 'content-type: application/json' \
-  --data @"$body" \
-  -o /dev/null -w "%{http_code}\n" 2>/dev/null \
-  | awk '{ if ($1 < 200 || $1 >= 300) { print "ADAPTER_ERROR: Coolify HTTP " $1 > "/dev/stderr"; exit 7 } }'
+# The POST body is built by jq from the value piped out of the sealed slot and handed to curl
+# on stdin (--data-binary @-). The API token reaches curl through a pipe (-H @<(...)), never
+# a file, argv or env. The response is discarded entirely: Coolify echoes the value back in
+# both create and get. --fail turns a non-2xx status into a non-zero exit.
+slot_value value \
+  | jq -c -Rs --arg k "$KEY" --argjson pre "$IS_PREVIEW" '{ key: $k, value: ., is_preview: $pre }' \
+  | curl -sS --fail -X "$METHOD" \
+      "${COOLIFY_URL%/}/api/v1/applications/${APP_UUID}/envs" \
+      -H @<(printf 'authorization: Bearer '; resolve_source "$API_KEY_SOURCE"; printf '\n') \
+      -H 'content-type: application/json' \
+      --data-binary @- \
+      -o /dev/null \
+  || { echo "ADAPTER_ERROR: Coolify write failed (above)" >&2; exit 7; }
 
 printf 'coolify-env:%s#%s\n' "$APP_UUID" "$KEY"

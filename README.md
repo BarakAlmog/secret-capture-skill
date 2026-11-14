@@ -179,11 +179,11 @@ Off by default — strict validation can reject legitimate edge cases. Turn on p
 
 The skill enforces these invariants for every adapter:
 
-- **Value never on argv** — adapters read stdin via `--rawfile /dev/stdin` or `cat -`; reject any `--value`-style flag
+- **Value never on argv** — adapters pipe it out of the sealed slot into the destination's stdin; reject any `--value`-style flag
 - **Value never in env** — nothing gets `export`ed
 - **Value never in shell history** — `set +o history` + `HISTFILE=/dev/null`
 - **Value never in stdout** — every subcommand that touches it is redirected to `/dev/null`
-- **Tempfiles are 0600 + shredded** — `umask 077` + `mktemp` + `trap shred EXIT`
+- **Value never in a plain-text file** — the dialog pipes into `f7 secret seal capture` (sealed to the Secure Enclave); adapters pipe out of `f7 secret open capture`. The slot is deleted after a write that landed and kept after a failure, so `--reuse` retries without a second paste. `scripts/lint-adapters.sh` fails on any temp file or redirect into a file
 - **Tool results** — the capture script's only stdout is the reference string
 
 See [`docs/SECURITY.md`](./docs/SECURITY.md) for the full threat model.
@@ -200,7 +200,9 @@ All errors emit machine-readable codes on stderr. The value is never in an error
 | `AUTH_FAIL` | `op` not signed in / `gh auth` expired / destination 401 |
 | `DUPLICATE` | Create without `--rotate`, record exists |
 | `FORMAT_MISMATCH` | `--expect` mismatch |
-| `ADAPTER_ERROR` | Subcommand non-zero exit |
+| `ADAPTER_ERROR` | Subcommand non-zero exit, or a write not verified |
+| `NOT_FOUND` | `--rotate` target missing |
+| `BUSY` | Another capture holds the sealed slot |
 
 ## Roadmap
 
@@ -211,7 +213,7 @@ All errors emit machine-readable codes on stderr. The value is never in an error
 
 ## Contributing
 
-PRs welcome. Each new adapter must pass the hygiene lint (`scripts/lint-adapters.sh`) proving no argv/env/history/stdout leak paths.
+PRs welcome. Each new adapter must pass the hygiene lint (`scripts/lint-adapters.sh`) proving no argv/env/history/stdout/file leak paths, and the stubbed end-to-end tests (`tests/run.sh`).
 
 ## License
 
